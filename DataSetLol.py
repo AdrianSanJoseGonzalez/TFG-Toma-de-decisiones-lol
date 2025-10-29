@@ -223,7 +223,13 @@ for match_index, match_id in enumerate(matches):
                         except Exception:
                             team_color = str(teamId)
 
-                        print(f" {summoner_name}/ {roll} [{team_color}]({champ}) || items {inventory_display} ||: {gold_spent} de oro")
+                         # Mapear teamId a color
+                        team_color = "Blue" if int(teamId) == 100 else "Red" if int(teamId) == 200 else str(teamId)
+
+                        # PRINT ESTILO LIMPIO
+                        print(f"[{team_color}] {summoner_name} ({roll}) - {champ}")
+                        print(f"  💰 Total gastado: {gold_spent}g, Total de oro {gold}g")
+                        print(f"  📦 Items: {' | '.join(inventory_display)}\n")
             else:
                 print(f"\nEl modo de juego {match_data['info'].get('gameMode', 'Desconocido')} no es CLASSIC. Saltando extracción de oro por minuto.")
         else:
