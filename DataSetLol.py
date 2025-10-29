@@ -125,16 +125,46 @@ for match_index, match_id in enumerate(matches):
                                 participant_inventories[p_idx].append(item_id)
                         
                         elif event_type == "ITEM_DESTROYED":
-                            # Remover item del inventario si existe
+                            # Remover el item destruido si lo tiene
                             if item_id in participant_inventories[p_idx]:
                                 participant_inventories[p_idx].remove(item_id)
-                            
-                            # IMPORTANTE: Si hay afterId, el item se transformó/evolucionó
+
+                            # === MANEJO DE EVOLUCIONES DE ÍTEMS ===
+                            evolutions = {
+                                3004: 3042,   # Manamune → Muramana
+                                3003: 3040,   # Archangel's Staff → Seraph's Embrace
+                                3865: 3866,   # World Atlas → Runic Compass
+                                3866: 3867,   # Runic Compass → Bounty of Worlds
+                                # Bounty of Worlds puede evolucionar a varios según la elección
+                                3867: [3869, 3870, 3871, 3876, 3877]
+                            }
+
+                            evolved = False
+
+                            if item_id in evolutions:
+                                new_id = evolutions[item_id]
+
+                                # Si la evolución es una lista, no podemos saber cuál eligió,
+                                # así que añadimos todas como posibles (o podrías inferirlo luego)
+                                if isinstance(new_id, list):
+                                    for nid in new_id:
+                                        if nid not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
+                                            participant_inventories[p_idx].append(nid)
+                                    evolved = True
+                                else:
+                                    if new_id not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
+                                        participant_inventories[p_idx].append(new_id)
+                                        evolved = True
+
+                                if evolved:
+                                    print(f"  🔄 Evolución detectada: Item {item_id} → {new_id}")
+
+                            # Si hay afterId normal del evento, también manejarlo (por si Riot lo incluye)
                             after_id = event.get("afterId")
                             if after_id and after_id != 0:
                                 if after_id not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
                                     participant_inventories[p_idx].append(after_id)
-                        
+                                                
                         elif event_type == "ITEM_SOLD":
                             # Remover item del inventario
                             if item_id in participant_inventories[p_idx]:
