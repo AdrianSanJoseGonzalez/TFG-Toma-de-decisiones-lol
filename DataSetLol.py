@@ -3,18 +3,22 @@ import pandas as pd
 from urllib.parse import quote
 import time
 
+
+
+
 # === CONFIGURACIÓN ===
 API_KEY = "RGAPI-71eb6754-a4d1-4f15-8dd8-1a33ee882c3d"  # pon tu API key actual
-Region = "asia"  # cambia según la región de routing: americas / asia / europe / sea
+Region = "asia"
 game_name = quote("Hide on bush")
-tag_line = "KR1"  # el tag de riot id, si usas endpoint riot id
+tag_line = "KR1"
+
 
 # === 1. Obtener PUUID del jugador ===
 url = f"https://{Region}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
 headers = {"X-Riot-Token": API_KEY}
 
-# Cache de datos de items (Data Dragon) - se usa para traducir IDs a nombres
-# Mover aquí la descarga evita pedirlo en cada frame/participante
+
+# Cache de datos de ítems (para mostrar nombres y costes)
 DD_ITEM_URL = "https://ddragon.leagueoflegends.com/cdn/15.21.1/data/en_US/item.json"
 try:
     _dd_resp = requests.get(DD_ITEM_URL)
@@ -22,22 +26,68 @@ try:
     item_data = _dd_resp.json()
     item_lookup = item_data.get("data", {})
 except Exception:
-    # Si falla la descarga, usamos un diccionario vacío para no romper el flujo
     item_lookup = {}
+
 
 response = requests.get(url, headers=headers)
 if response.status_code == 200:
     data = response.json()
-    # Convertir la respuesta a un DataFrame de pandas
     df = pd.DataFrame([data])
-    # Extraer el puuid como variable
-    puuid = df['puuid'].iloc[0]  # Obtiene el primer (y único) valor de la columna puuid
-    print("\nPuuid guardado")
+    puuid = df['puuid'].iloc[0]
+    print("\n✅ Puuid guardado")
 else:
     print(f"Error: {response.status_code}")
+    exit()
+
+
+
+
+# === FUNCIONES AUXILIARES ===
+
+
+def is_trinket(item_id: int) -> bool:
+    """Devuelve True si el ítem es un trinket (ítem de visión)."""
+    return item_id in [3340, 3363, 3364, 3362, 3361]
+
+
+
+
+def infer_item_evolution(item_id: int, inventory: list, champion_name: str) -> None:
+    """
+    Heurística para inferir en qué ítem evolucionó Bounty of Worlds (3867),
+    cuando el evento de compra no aparece en el timeline.
+    """
+    SUPPORT_EVOLUTIONS = {
+        # Enchanters
+        "Lulu": 3877, "Janna": 3877, "Nami": 3877, "Sona": 3877, "Seraphine": 3877, "Milio": 3877,
+        # Engage/Tanks
+        "Leona": 3876, "Nautilus": 3876, "Rell": 3876, "Alistar": 3876, "Blitzcrank": 3876, "Braum": 3876,
+        # Mages poke
+        "Zyra": 3870, "Brand": 3870, "Velkoz": 3870, "Xerath": 3870, "Karma": 3870,
+        # Utility
+        "Bard": 3871, "RenataGlasc": 3871, "Thresh": 3871,
+        # Defensivos o visión
+        "Senna": 3869, "Soraka": 3869,
+    }
+
+
+    DEFAULT_EVOLUTION = 3869
+    evolved_item = SUPPORT_EVOLUTIONS.get(champion_name, DEFAULT_EVOLUTION)
+
+
+    # Sustituir el ítem en inventario
+    if item_id in inventory:
+        inventory.remove(item_id)
+    if evolved_item not in inventory and len(inventory) < 6:  # 6 slots normales
+        inventory.append(evolved_item)
+
+
+    print(f"🧭 Inferida evolución automática para {champion_name}: 3867 → {evolved_item}")
+
+
+
 
 # === 2. Obtener lista de partidas ===
-# Número de partidas a solicitar (ajústalo si quieres más/menos)
 MATCH_COUNT = 1
 url_matches = f"https://{Region}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count={MATCH_COUNT}"
 resp_matches = requests.get(url_matches, headers=headers)
@@ -48,24 +98,26 @@ else:
     print(f"Error al obtener IDs de partidas: {resp_matches.status_code}")
     matches = []
 
-# Diccionario para mantener el inventario de cada participante
-participant_inventories = {i: [] for i in range(10)}  # 0-9 para los 10 participantes
 
-# === 3. Procesar cada partida obtenida ===
+# Diccionario para mantener inventarios (6 items + trinket separado)
+participant_inventories = {i: [] for i in range(10)}
+participant_trinkets = {i: None for i in range(10)}
+
+
+# === 3. Procesar cada partida ===
 for match_index, match_id in enumerate(matches):
     print(f"\n--- Procesando partida {match_index + 1}/{len(matches)}: {match_id} ---")
 
-    # Timeline
+
     url_timeline = f"https://{Region}.api.riotgames.com/lol/match/v5/matches/{match_id}/timeline"
     resp_timeline = requests.get(url_timeline, headers=headers)
     if resp_timeline.status_code != 200:
         print(f"No se pudo obtener timeline para {match_id}: {resp_timeline.status_code}")
-        # Respeta rate limit mínimo antes de continuar con la siguiente
         time.sleep(1.2)
         continue
     match_datatimeline = resp_timeline.json()
 
-    # Match data
+
     url_match = f"https://{Region}.api.riotgames.com/lol/match/v5/matches/{match_id}"
     resp_match = requests.get(url_match, headers=headers)
     if resp_match.status_code != 200:
@@ -74,18 +126,16 @@ for match_index, match_id in enumerate(matches):
         continue
     match_data = resp_match.json()
 
-   
-   # 4️⃣ Obtener oro por minuto hasta la duración de la partida
+
     if "info" in match_datatimeline and "frames" in match_datatimeline["info"]:
         frames = match_datatimeline["info"]["frames"]
         partidafinalSeg = match_data["info"].get("gameDuration", 0)
         partidaDuracionMax = partidafinalSeg // 60
-        # limitar al número de frames disponibles
         max_minute_index = min(partidaDuracionMax, len(frames) - 1)
+
 
         if max_minute_index >= 0:
             if match_data["info"].get("gameMode") == "CLASSIC":
-                # cachear nombres por puuid para no pedirlos en cada minuto
                 puuid_to_name = {}
                 for p in match_data["info"]["participants"]:
                     p_puuid = p.get("puuid")
@@ -100,142 +150,126 @@ for match_index, match_id in enumerate(matches):
                         except Exception:
                             puuid_to_name[p_puuid] = "Desconocido"
 
-                # iterar por cada minuto desde 0 hasta max_minute_index
+
+                # === Procesar minuto a minuto ===
                 for minute in range(0, max_minute_index + 1):
                     frame = frames[minute]
-                    
-                    # Procesar eventos del frame actual PRIMERO
                     events = frame.get("events", [])
                     for event in events:
                         participant_id = event.get("participantId")
                         if not participant_id or participant_id < 1 or participant_id > 10:
                             continue
-                        
-                        p_idx = participant_id - 1  # Convertir a índice 0-9
+
+
+                        p_idx = participant_id - 1
                         event_type = event.get("type")
                         item_id = event.get("itemId")
-                        
-                        # Ignorar items con ID 0 o None
                         if not item_id or item_id == 0:
                             continue
-                        
+
+
+                        # === GESTIÓN DE EVENTOS ===
                         if event_type == "ITEM_PURCHASED":
-                            # Añadir item al inventario del participante
-                            if item_id not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
+                            if is_trinket(item_id):
+                                participant_trinkets[p_idx] = item_id
+                            elif item_id not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
                                 participant_inventories[p_idx].append(item_id)
-                        
+
+
                         elif event_type == "ITEM_DESTROYED":
-                            # Remover el item destruido si lo tiene
-                            if item_id in participant_inventories[p_idx]:
+                            if is_trinket(item_id):
+                                if participant_trinkets[p_idx] == item_id:
+                                    participant_trinkets[p_idx] = None
+                            elif item_id in participant_inventories[p_idx]:
                                 participant_inventories[p_idx].remove(item_id)
 
-                            # === MANEJO DE EVOLUCIONES DE ÍTEMS ===
+
+                            # === Evoluciones conocidas ===
                             evolutions = {
-                                3004: 3042,   # Manamune → Muramana
-                                3003: 3040,   # Archangel's Staff → Seraph's Embrace
-                                3865: 3866,   # World Atlas → Runic Compass
-                                3866: 3867,   # Runic Compass → Bounty of Worlds
-                                # Bounty of Worlds puede evolucionar a varios según la elección
-                                3867: [3869, 3870, 3871, 3876, 3877]
+                                3004: 3042,  # Manamune → Muramana
+                                3003: 3040,  # Archangel’s Staff → Seraph’s Embrace
+                                3865: 3866,  # World Atlas → Runic Compass
+                                3866: 3867,  # Runic Compass → Bounty of Worlds
+                                3010: 3013,  # Catalyst → Rod of Ages
                             }
 
-                            evolved = False
 
                             if item_id in evolutions:
                                 new_id = evolutions[item_id]
+                                if new_id not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
+                                    participant_inventories[p_idx].append(new_id)
+                                    print(f"🔄 Evolución directa: {item_id} → {new_id}")
 
-                                # Si la evolución es una lista, no podemos saber cuál eligió,
-                                # así que añadimos todas como posibles (o podrías inferirlo luego)
-                                if isinstance(new_id, list):
-                                    for nid in new_id:
-                                        if nid not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
-                                            participant_inventories[p_idx].append(nid)
-                                    evolved = True
-                                else:
-                                    if new_id not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
-                                        participant_inventories[p_idx].append(new_id)
-                                        evolved = True
 
-                                if evolved:
-                                    print(f"  🔄 Evolución detectada: Item {item_id} → {new_id}")
+                            elif item_id == 3867:  # Bounty of Worlds
+                                champ_name = match_data["info"]["participants"][p_idx].get("championName", "?")
+                                infer_item_evolution(item_id, participant_inventories[p_idx], champ_name)
 
-                            # Si hay afterId normal del evento, también manejarlo (por si Riot lo incluye)
-                            after_id = event.get("afterId")
-                            if after_id and after_id != 0:
-                                if after_id not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
-                                    participant_inventories[p_idx].append(after_id)
-                                                
+
                         elif event_type == "ITEM_SOLD":
-                            # Remover item del inventario
                             if item_id in participant_inventories[p_idx]:
                                 participant_inventories[p_idx].remove(item_id)
-                        
+
+
                         elif event_type == "ITEM_UNDO":
-                            # Revertir compra
                             before_id = event.get("beforeId")
                             after_id = event.get("afterId")
-                            
                             if after_id and after_id in participant_inventories[p_idx]:
                                 participant_inventories[p_idx].remove(after_id)
                             if before_id and before_id != 0:
-                                if before_id not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
+                                if is_trinket(before_id):
+                                    participant_trinkets[p_idx] = before_id
+                                elif before_id not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
                                     participant_inventories[p_idx].append(before_id)
 
-                    # DESPUÉS de procesar eventos, mostrar inventarios
-                    print(f"\nOro de cada jugador al minuto {minute} en {match_data['info'].get('gameMode','Desconocido')} (match {match_id}):")
-                    for participant_id in range(10):
-                        participantFrames = frame.get("participantFrames", {})
-                        pf = participantFrames.get(str(participant_id + 1), {})
-                        gold = pf.get("totalGold", "N/A")
-                        
-                        # Convertir IDs a nombres y costos
-                        inventory_display = []
-                        gold_spent = 0
-                        
-                        for item_id in participant_inventories[participant_id]:
-                            item_info = item_lookup.get(str(item_id), {})
-                            name = item_info.get("name", f"Item_{item_id}")
-                            cost = item_info.get("gold", {}).get("total", 0)
-                            
-                            if name == "Oracle Lens" or "Ward" in name:
-                                continue  # No mostrar wards/trinkets
-                            
-                            gold_spent += cost
-                            inventory_display.append(f"{name} ({cost})")
-                        
-                        # Rellenar con "NA" hasta tener 6 slots
-                        while len(inventory_display) < 6:
-                            inventory_display.append("NA")
 
+                    # === Mostrar inventario y oro ===
+                    print(f"\n💰 Oro al minuto {minute} en {match_data['info'].get('gameMode','?')} (match {match_id}):")
+                    for participant_id in range(10):
+                        pf = frame.get("participantFrames", {}).get(str(participant_id + 1), {})
+                        gold = pf.get("totalGold", "N/A")
                         champ = match_data["info"]["participants"][participant_id].get("championName", "?")
                         puuidTot = match_data["info"]["participants"][participant_id].get("puuid")
                         roll = match_data["info"]["participants"][participant_id].get("teamPosition", "?")
                         teamId = match_data["info"]["participants"][participant_id].get("teamId", "?")
                         summoner_name = puuid_to_name.get(puuidTot, "Desconocido")
-
-                        # Mapear teamId a color
-                        team_color = "Desconocido"
-                        try:
-                            if int(teamId) == 100:
-                                team_color = "blue"
-                            elif int(teamId) == 200:
-                                team_color = "red"
-                        except Exception:
-                            team_color = str(teamId)
-
-                         # Mapear teamId a color
                         team_color = "Blue" if int(teamId) == 100 else "Red" if int(teamId) == 200 else str(teamId)
 
-                        # PRINT ESTILO LIMPIO
-                        print(f"[{team_color}] {summoner_name} ({roll}) - {champ}")
-                        print(f"  💰 Total gastado: {gold_spent}g, Total de oro {gold}g")
-                        print(f"  📦 Items: {' | '.join(inventory_display)}\n")
-            else:
-                print(f"\nEl modo de juego {match_data['info'].get('gameMode', 'Desconocido')} no es CLASSIC. Saltando extracción de oro por minuto.")
-        else:
-            print(f"No hay suficientes frames en timeline para extraer datos por minuto (frames={len(frames)})")
-    else:
-        print("Timeline no contiene 'info' o 'frames'. No se puede extraer datos por minuto.")
 
-    # Pausa entre partidas para evitar rate limits
+                        inv_display = []
+                        gold_spent = 0
+                        for iid in participant_inventories[participant_id]:
+                            info = item_lookup.get(str(iid), {})
+                            name = info.get("name", f"Item_{iid}")
+                            cost = info.get("gold", {}).get("total", 0)
+                            inv_display.append(f"{name} ({cost})")
+                            gold_spent += cost
+
+
+                        # Añadir trinket (si existe)
+                        trinket_id = participant_trinkets[participant_id]
+                        if trinket_id:
+                            info = item_lookup.get(str(trinket_id), {})
+                            trinket_name = info.get("name", f"Item_{trinket_id}")
+                            inv_display.append(f"{trinket_name} (Trinket)")
+
+
+                        while len(inv_display) < 7:
+                            inv_display.append("NA")
+
+
+                        print(f"[{team_color}] {summoner_name} ({roll}) - {champ}")
+                        print(f"  💰 Total gastado: {gold_spent}g, Total oro: {gold}g")
+                        print(f"  📦 Items: {' | '.join(inv_display)}\n")
+
+
+            else:
+                print(f"Modo {match_data['info'].get('gameMode', '?')} no es CLASSIC. Saltando.")
+
+
     time.sleep(1.2)
+
+
+
+
+
