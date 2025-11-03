@@ -7,7 +7,7 @@ import time
 
 
 # === CONFIGURACIÓN ===
-API_KEY = "RGAPI-71eb6754-a4d1-4f15-8dd8-1a33ee882c3d"  # pon tu API key actual
+API_KEY = "RGAPI-937424c2-e147-49c6-a0bb-ae07e45d6132"  # pon tu API key actual
 Region = "asia"
 game_name = quote("Hide on bush")
 tag_line = "KR1"
@@ -18,7 +18,7 @@ url = f"https://{Region}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{
 headers = {"X-Riot-Token": API_KEY}
 
 
-# Cache de datos de ítems (para mostrar nombres y costes)
+# Cache de datos de ítems (para mostrar nombres y costes de items)
 DD_ITEM_URL = "https://ddragon.leagueoflegends.com/cdn/15.21.1/data/en_US/item.json"
 try:
     _dd_resp = requests.get(DD_ITEM_URL)
@@ -98,16 +98,15 @@ else:
     print(f"Error al obtener IDs de partidas: {resp_matches.status_code}")
     matches = []
 
-
-# Diccionario para mantener inventarios (6 items + trinket separado)
-participant_inventories = {i: [] for i in range(10)}
-participant_trinkets = {i: None for i in range(10)}
-
+STEALTH_WARD_ID = 3340
 
 # === 3. Procesar cada partida ===
 for match_index, match_id in enumerate(matches):
     print(f"\n--- Procesando partida {match_index + 1}/{len(matches)}: {match_id} ---")
 
+    participant_kills = {i: 0 for i in range(10)}
+    participant_inventories = {i: [] for i in range(10)}
+    participant_trinkets = {i: STEALTH_WARD_ID for i in range(10)}
 
     url_timeline = f"https://{Region}.api.riotgames.com/lol/match/v5/matches/{match_id}/timeline"
     resp_timeline = requests.get(url_timeline, headers=headers)
@@ -164,8 +163,7 @@ for match_index, match_id in enumerate(matches):
                         p_idx = participant_id - 1
                         event_type = event.get("type")
                         item_id = event.get("itemId")
-                        if not item_id or item_id == 0:
-                            continue
+                        
 
 
                         # === GESTIÓN DE EVENTOS ===
@@ -175,11 +173,17 @@ for match_index, match_id in enumerate(matches):
                             elif item_id not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
                                 participant_inventories[p_idx].append(item_id)
 
+                        
+                        elif event_type == "CHAMPION_KILL" or event_type == "CHAMPION_SPECIAL_KILL":
+                            killerId = event.get("killerId")
+                             
+                            if killerId and 1 <= killerId <= 10:
+                                participant_kills[killerId -1] += 1
 
                         elif event_type == "ITEM_DESTROYED":
                             if is_trinket(item_id):
                                 if participant_trinkets[p_idx] == item_id:
-                                    participant_trinkets[p_idx] = None
+                                    participant_trinkets[p_idx] = STEALTH_WARD_ID
                             elif item_id in participant_inventories[p_idx]:
                                 participant_inventories[p_idx].remove(item_id)
 
@@ -190,7 +194,7 @@ for match_index, match_id in enumerate(matches):
                                 3003: 3040,  # Archangel’s Staff → Seraph’s Embrace
                                 3865: 3866,  # World Atlas → Runic Compass
                                 3866: 3867,  # Runic Compass → Bounty of Worlds
-                                3010: 3013,  # Catalyst → Rod of Ages
+                                3010: 3013,  # symbiotic 
                             }
 
 
@@ -213,14 +217,13 @@ for match_index, match_id in enumerate(matches):
 
                         elif event_type == "ITEM_UNDO":
                             before_id = event.get("beforeId")
-                            after_id = event.get("afterId")
-                            if after_id and after_id in participant_inventories[p_idx]:
-                                participant_inventories[p_idx].remove(after_id)
-                            if before_id and before_id != 0:
-                                if is_trinket(before_id):
-                                    participant_trinkets[p_idx] = before_id
-                                elif before_id not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
-                                    participant_inventories[p_idx].append(before_id)
+                            if before_id:
+                                # Si es trinket, restauramos el trinket base
+                                if is_trinket(before_id) and participant_trinkets[p_idx] == before_id:
+                                    participant_trinkets[p_idx] = STEALTH_WARD_ID
+                                # Si es ítem normal, lo eliminamos del inventario
+                                elif before_id in participant_inventories[p_idx]:
+                                    participant_inventories[p_idx].remove(before_id)
 
 
                     # === Mostrar inventario y oro ===
@@ -234,6 +237,11 @@ for match_index, match_id in enumerate(matches):
                         teamId = match_data["info"]["participants"][participant_id].get("teamId", "?")
                         summoner_name = puuid_to_name.get(puuidTot, "Desconocido")
                         team_color = "Blue" if int(teamId) == 100 else "Red" if int(teamId) == 200 else str(teamId)
+                        level = pf.get("level", "N/A")
+                        position = pf.get("position", {"x": "N/A", "y": "N/A"})
+                        kills = pf.get("kills", "N/A")
+                        deaths = pf.get("deaths", "N/A")
+                        assists = pf.get("assists", "N/A")
 
 
                         inv_display = []
@@ -259,6 +267,13 @@ for match_index, match_id in enumerate(matches):
 
 
                         print(f"[{team_color}] {summoner_name} ({roll}) - {champ}")
+                        print(f"  🏅 Nivel: {level}, "
+                        f"K/D/A: {participant_kills[participant_id]}/{[participant_id]} "
+     
+                    f"Posición: ({position.get('x')}, {position.get('y')})")
+                        print(f"  🏅 Nivel: {level}, K/D/A: {participant_kills[participant_id]}/{deaths}/{assists}, Posición: ({position.get('x')}, {position.get('y')})")
+                        #print(f"  🏅 Nivel: {level}, K/D/A: {participant_kills[participant_id]}/{deaths}/{assists}, Posición: ({position.get('x')}, {position.get('y')})")
+                        #print(f"⚔️ {match_data['info']['participants'][p_idx].get('championName','?')} ({puuid_to_name.get(match_data['info']['participants'][p_idx].get('puuid'),'Desconocido')}) ha matado a {event.get('victimId')} en el minuto {minute}")
                         print(f"  💰 Total gastado: {gold_spent}g, Total oro: {gold}g")
                         print(f"  📦 Items: {' | '.join(inv_display)}\n")
 
