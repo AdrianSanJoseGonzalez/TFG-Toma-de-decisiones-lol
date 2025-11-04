@@ -50,6 +50,17 @@ def is_trinket(item_id: int) -> bool:
     return item_id in [3340, 3363, 3364, 3362, 3361]
 
 
+def calculate_death_timer(level: int) -> float:
+    """
+    Calcula el tiempo de muerte en segundos basado en el nivel del campeón.
+    Fórmula aproximada de League of Legends:
+    - Niveles 1-6: 4 + (2 * nivel) segundos
+    - Niveles 7-18: 7.5 + (2.5 * (nivel - 6)) segundos
+    """
+    if level <= 6:
+        return 4 + (2 * level)
+    else:
+        return 21 + (2.5 * (level - 6))
 
 
 def infer_item_evolution(item_id: int, inventory: list, champion_name: str) -> None:
@@ -105,8 +116,13 @@ for match_index, match_id in enumerate(matches):
     print(f"\n--- Procesando partida {match_index + 1}/{len(matches)}: {match_id} ---")
 
     participant_kills = {i: 0 for i in range(10)}
+    participant_deaths = {i: 0 for i in range(10)}
+    participant_assists = {i: 0 for i in range(10)}
     participant_inventories = {i: [] for i in range(10)}
     participant_trinkets = {i: STEALTH_WARD_ID for i in range(10)}
+    
+    # Tracking de estado vivo/muerto: guarda el timestamp de muerte y tiempo de respawn
+    participant_death_info = {i: {"is_dead": False, "respawn_time": 0} for i in range(10)}
 
     url_timeline = f"https://{Region}.api.riotgames.com/lol/match/v5/matches/{match_id}/timeline"
     resp_timeline = requests.get(url_timeline, headers=headers)
@@ -154,16 +170,42 @@ for match_index, match_id in enumerate(matches):
                 for minute in range(0, max_minute_index + 1):
                     frame = frames[minute]
                     events = frame.get("events", [])
+                    current_frame_timestamp = frame.get("timestamp", minute * 60000)  # timestamp en ms
+                    
                     for event in events:
                         event_type = event.get("type")
+                        event_timestamp = event.get("timestamp", 0)  # en milisegundos
                         
-                        # ⬅️ PROCESAR KILLS PRIMERO (no tienen itemId ni participantId como killer)
-                        # Las kils estan mal pues hay campeones que tienen mas kills que las que se les asignan
-
+                        # ⬅️ PROCESAR KILLS, DEATHS Y ASISTENCIAS
                         if event_type == "CHAMPION_KILL":
                             killerId = event.get("killerId")
                             if killerId and 1 <= killerId <= 10:
                                 participant_kills[killerId - 1] += 1
+
+                            assisting_ids = event.get("assistingParticipantIds", [])
+                            for assist_id in assisting_ids:
+                                if assist_id and 1 <= assist_id <= 10:
+                                    participant_assists[assist_id - 1] += 1
+
+                            victimId = event.get("victimId")
+                            if victimId and 1 <= victimId <= 10:
+                                victim_idx = victimId - 1
+                                participant_deaths[victim_idx] += 1
+                                
+                                # Obtener nivel de la víctima en el momento de la muerte
+                                victim_frame = frame.get("participantFrames", {}).get(str(victimId), {})
+                                victim_level = victim_frame.get("level", 1)
+                                
+                                # Calcular tiempo de respawn
+                                death_timer = calculate_death_timer(victim_level)
+                                respawn_timestamp = event_timestamp + (death_timer * 1000)  # convertir a ms
+                                
+                                # Marcar como muerto
+                                participant_death_info[victim_idx] = {
+                                    "is_dead": True,
+                                    "respawn_time": respawn_timestamp
+                                }
+                                
                             continue  # Siguiente evento
                         
                         # Para el resto de eventos, verificar participantId
@@ -219,6 +261,13 @@ for match_index, match_id in enumerate(matches):
                                 elif before_id in participant_inventories[p_idx]:
                                     participant_inventories[p_idx].remove(before_id)
 
+                    # Actualizar estados de vivo/muerto al final de cada minuto
+                    for participant_id in range(10):
+                        death_info = participant_death_info[participant_id]
+                        if death_info["is_dead"] and current_frame_timestamp >= death_info["respawn_time"]:
+                            # El jugador ha respawneado
+                            participant_death_info[participant_id]["is_dead"] = False
+
                     # === Mostrar inventario y oro ===
                     print(f"\n💰 Oro al minuto {minute} en {match_data['info'].get('gameMode','?')} (match {match_id}):")
                     for participant_id in range(10):
@@ -232,8 +281,17 @@ for match_index, match_id in enumerate(matches):
                         team_color = "Blue" if int(teamId) == 100 else "Red" if int(teamId) == 200 else str(teamId)
                         level = pf.get("level", "N/A")
                         position = pf.get("position", {"x": "N/A", "y": "N/A"})
-                        deaths = pf.get("deaths", "N/A")
-                        assists = pf.get("assists", "N/A")
+                        
+                        # Determinar estado
+                        is_dead = participant_death_info[participant_id]["is_dead"]
+                        status_emoji = "💀" if is_dead else "✅"
+                        status_text = "MUERTO" if is_dead else "VIVO"
+                        
+                        # Calcular tiempo restante de respawn si está muerto
+                        respawn_info = ""
+                        if is_dead:
+                            time_to_respawn = (participant_death_info[participant_id]["respawn_time"] - current_frame_timestamp) / 1000
+                            respawn_info = f" (respawn en {time_to_respawn:.1f}s)"
 
                         inv_display = []
                         gold_spent = 0
@@ -255,9 +313,65 @@ for match_index, match_id in enumerate(matches):
                             inv_display.append("NA")
 
                         print(f"[{team_color}] {summoner_name} ({roll}) - {champ}")
-                        print(f"  🏅 Nivel: {level}, K/D/A: {participant_kills[participant_id]}/{deaths}/{assists}, Posición: ({position.get('x')}, {position.get('y')})")
+                        print(f"  {status_emoji} Estado: {status_text}{respawn_info}")
+                        print(f"  🏅 Nivel: {level}, K/D/A: {participant_kills[participant_id]}/{participant_deaths[participant_id]}/{participant_assists[participant_id]}, Posición: ({position.get('x')}, {position.get('y')})")
                         print(f"  💰 Total gastado: {gold_spent}g, Total oro: {gold}g")
                         print(f"  📦 Items: {' | '.join(inv_display)}\n")
+                
+                # === MINUTO EXTRA CON ESTADÍSTICAS FINALES ===
+                print(f"\n{'='*80}")
+                print(f"🏁 ESTADO FINAL DE LA PARTIDA (Minuto {max_minute_index + 1}) - {match_id}")
+                print(f"{'='*80}\n")
+                
+                for participant_id in range(10):
+                    participant = match_data["info"]["participants"][participant_id]
+                    
+                    # Obtener estadísticas finales reales
+                    final_kills = participant.get("kills", 0)
+                    final_deaths = participant.get("deaths", 0)
+                    final_assists = participant.get("assists", 0)
+                    final_gold = participant.get("goldEarned", 0)
+                    final_level = participant.get("champLevel", "N/A")
+                    
+                    champ = participant.get("championName", "?")
+                    puuidTot = participant.get("puuid")
+                    roll = participant.get("teamPosition", "?")
+                    teamId = participant.get("teamId", "?")
+                    summoner_name = puuid_to_name.get(puuidTot, "Desconocido")
+                    team_color = "Blue" if int(teamId) == 100 else "Red" if int(teamId) == 200 else str(teamId)
+                    
+                    final_items = [
+                        participant.get("item0", 0),
+                        participant.get("item1", 0),
+                        participant.get("item2", 0),
+                        participant.get("item3", 0),
+                        participant.get("item4", 0),
+                        participant.get("item5", 0),
+                    ]
+                    final_trinket = participant.get("item6", 0)
+                    
+                    inv_display = []
+                    gold_spent = 0
+                    for iid in final_items:
+                        if iid != 0:
+                            info = item_lookup.get(str(iid), {})
+                            name = info.get("name", f"Item_{iid}")
+                            cost = info.get("gold", {}).get("total", 0)
+                            inv_display.append(f"{name} ({cost})")
+                            gold_spent += cost
+                    
+                    if final_trinket != 0:
+                        info = item_lookup.get(str(final_trinket), {})
+                        trinket_name = info.get("name", f"Item_{final_trinket}")
+                        inv_display.append(f"{trinket_name} (Trinket)")
+                    
+                    while len(inv_display) < 7:
+                        inv_display.append("NA")
+                    
+                    print(f"[{team_color}] {summoner_name} ({roll}) - {champ}")
+                    print(f"  🏅 Nivel: {final_level}, K/D/A: {final_kills}/{final_deaths}/{final_assists}")
+                    print(f"  💰 Total gastado: {gold_spent}g, Total oro ganado: {final_gold}g")
+                    print(f"  📦 Items: {' | '.join(inv_display)}\n")
 
             else:
                 print(f"Modo {match_data['info'].get('gameMode', '?')} no es CLASSIC. Saltando.")
