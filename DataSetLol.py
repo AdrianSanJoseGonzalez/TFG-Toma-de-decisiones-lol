@@ -7,7 +7,7 @@ import time
 
 
 # === CONFIGURACIÓN ===
-API_KEY = "RGAPI-937424c2-e147-49c6-a0bb-ae07e45d6132"  # pon tu API key actual
+API_KEY = "RGAPI-60232fe0-9d77-4d6c-abc6-d633a2b9a562"  # pon tu API key actual
 Region = "asia"
 game_name = quote("Hide on bush")
 tag_line = "KR1"
@@ -155,16 +155,24 @@ for match_index, match_id in enumerate(matches):
                     frame = frames[minute]
                     events = frame.get("events", [])
                     for event in events:
+                        event_type = event.get("type")
+                        
+                        # ⬅️ PROCESAR KILLS PRIMERO (no tienen itemId ni participantId como killer)
+                        # Las kils estan mal pues hay campeones que tienen mas kills que las que se les asignan
+
+                        if event_type == "CHAMPION_KILL":
+                            killerId = event.get("killerId")
+                            if killerId and 1 <= killerId <= 10:
+                                participant_kills[killerId - 1] += 1
+                            continue  # Siguiente evento
+                        
+                        # Para el resto de eventos, verificar participantId
                         participant_id = event.get("participantId")
                         if not participant_id or participant_id < 1 or participant_id > 10:
                             continue
 
-
                         p_idx = participant_id - 1
-                        event_type = event.get("type")
                         item_id = event.get("itemId")
-                        
-
 
                         # === GESTIÓN DE EVENTOS ===
                         if event_type == "ITEM_PURCHASED":
@@ -173,13 +181,6 @@ for match_index, match_id in enumerate(matches):
                             elif item_id not in participant_inventories[p_idx] and len(participant_inventories[p_idx]) < 6:
                                 participant_inventories[p_idx].append(item_id)
 
-                        
-                        elif event_type == "CHAMPION_KILL" or event_type == "CHAMPION_SPECIAL_KILL":
-                            killerId = event.get("killerId")
-                             
-                            if killerId and 1 <= killerId <= 10:
-                                participant_kills[killerId -1] += 1
-
                         elif event_type == "ITEM_DESTROYED":
                             if is_trinket(item_id):
                                 if participant_trinkets[p_idx] == item_id:
@@ -187,16 +188,14 @@ for match_index, match_id in enumerate(matches):
                             elif item_id in participant_inventories[p_idx]:
                                 participant_inventories[p_idx].remove(item_id)
 
-
                             # === Evoluciones conocidas ===
                             evolutions = {
                                 3004: 3042,  # Manamune → Muramana
-                                3003: 3040,  # Archangel’s Staff → Seraph’s Embrace
+                                3003: 3040,  # Archangel's Staff → Seraph's Embrace
                                 3865: 3866,  # World Atlas → Runic Compass
                                 3866: 3867,  # Runic Compass → Bounty of Worlds
                                 3010: 3013,  # symbiotic 
                             }
-
 
                             if item_id in evolutions:
                                 new_id = evolutions[item_id]
@@ -204,27 +203,21 @@ for match_index, match_id in enumerate(matches):
                                     participant_inventories[p_idx].append(new_id)
                                     print(f"🔄 Evolución directa: {item_id} → {new_id}")
 
-
                             elif item_id == 3867:  # Bounty of Worlds
                                 champ_name = match_data["info"]["participants"][p_idx].get("championName", "?")
                                 infer_item_evolution(item_id, participant_inventories[p_idx], champ_name)
-
 
                         elif event_type == "ITEM_SOLD":
                             if item_id in participant_inventories[p_idx]:
                                 participant_inventories[p_idx].remove(item_id)
 
-
                         elif event_type == "ITEM_UNDO":
                             before_id = event.get("beforeId")
                             if before_id:
-                                # Si es trinket, restauramos el trinket base
                                 if is_trinket(before_id) and participant_trinkets[p_idx] == before_id:
                                     participant_trinkets[p_idx] = STEALTH_WARD_ID
-                                # Si es ítem normal, lo eliminamos del inventario
                                 elif before_id in participant_inventories[p_idx]:
                                     participant_inventories[p_idx].remove(before_id)
-
 
                     # === Mostrar inventario y oro ===
                     print(f"\n💰 Oro al minuto {minute} en {match_data['info'].get('gameMode','?')} (match {match_id}):")
@@ -239,10 +232,8 @@ for match_index, match_id in enumerate(matches):
                         team_color = "Blue" if int(teamId) == 100 else "Red" if int(teamId) == 200 else str(teamId)
                         level = pf.get("level", "N/A")
                         position = pf.get("position", {"x": "N/A", "y": "N/A"})
-                        kills = pf.get("kills", "N/A")
                         deaths = pf.get("deaths", "N/A")
                         assists = pf.get("assists", "N/A")
-
 
                         inv_display = []
                         gold_spent = 0
@@ -253,7 +244,6 @@ for match_index, match_id in enumerate(matches):
                             inv_display.append(f"{name} ({cost})")
                             gold_spent += cost
 
-
                         # Añadir trinket (si existe)
                         trinket_id = participant_trinkets[participant_id]
                         if trinket_id:
@@ -261,30 +251,15 @@ for match_index, match_id in enumerate(matches):
                             trinket_name = info.get("name", f"Item_{trinket_id}")
                             inv_display.append(f"{trinket_name} (Trinket)")
 
-
                         while len(inv_display) < 7:
                             inv_display.append("NA")
 
-
                         print(f"[{team_color}] {summoner_name} ({roll}) - {champ}")
-                        print(f"  🏅 Nivel: {level}, "
-                        f"K/D/A: {participant_kills[participant_id]}/{[participant_id]} "
-     
-                    f"Posición: ({position.get('x')}, {position.get('y')})")
                         print(f"  🏅 Nivel: {level}, K/D/A: {participant_kills[participant_id]}/{deaths}/{assists}, Posición: ({position.get('x')}, {position.get('y')})")
-                        #print(f"  🏅 Nivel: {level}, K/D/A: {participant_kills[participant_id]}/{deaths}/{assists}, Posición: ({position.get('x')}, {position.get('y')})")
-                        #print(f"⚔️ {match_data['info']['participants'][p_idx].get('championName','?')} ({puuid_to_name.get(match_data['info']['participants'][p_idx].get('puuid'),'Desconocido')}) ha matado a {event.get('victimId')} en el minuto {minute}")
                         print(f"  💰 Total gastado: {gold_spent}g, Total oro: {gold}g")
                         print(f"  📦 Items: {' | '.join(inv_display)}\n")
-
 
             else:
                 print(f"Modo {match_data['info'].get('gameMode', '?')} no es CLASSIC. Saltando.")
 
-
     time.sleep(1.2)
-
-
-
-
-
