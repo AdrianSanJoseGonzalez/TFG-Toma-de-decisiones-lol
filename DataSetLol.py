@@ -7,7 +7,7 @@ import time
 
 
 # === CONFIGURACIÓN ===
-API_KEY = "RGAPI-60232fe0-9d77-4d6c-abc6-d633a2b9a562"  # pon tu API key actual
+API_KEY = "RGAPI-14acd660-5abe-4316-a45f-f74a89bc14ff"  # pon tu API key actual
 Region = "asia"
 game_name = quote("Hide on bush")
 tag_line = "KR1"
@@ -99,7 +99,7 @@ def infer_item_evolution(item_id: int, inventory: list, champion_name: str) -> N
 
 
 # === 2. Obtener lista de partidas ===
-MATCH_COUNT = 1
+MATCH_COUNT = 2
 url_matches = f"https://{Region}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count={MATCH_COUNT}"
 resp_matches = requests.get(url_matches, headers=headers)
 if resp_matches.status_code == 200:
