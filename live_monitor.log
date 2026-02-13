@@ -1,0 +1,2014 @@
+import requests
+import os
+import time
+import json
+import base64
+import psutil
+import threading
+from datetime import datetime
+from urllib3.exceptions import InsecureRequestWarning
+
+# Desactivar warnings SSL
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+# === CONFIGURACIÓN ===
+API_KEY = "RGAPI-c239fa40-be3e-4891-b9ee-ea35f0b5b8a9"
+REGION_PLATFORM = "euw1"
+REGION_ROUTING = "europe"
+SAVE_PATH = "Replays_Live"
+LOG_FILE = "live_monitor.log"
+
+# Configuración de monitoreo
+CHECK_INTERVAL = 180  # Revisar cada 3 minutos
+NUM_CHALLENGERS = 50  # Top 50 Challengers
+MAX_WAIT_TIME = 120   # Esperar máximo 2 horas por partida
+
+# Estado del sistema
+os.makedirs(SAVE_PATH, exist_ok=True)
+active_games = {}  # {game_id: {puuid, start_time, player_name}}
+downloaded_games = set()  # IDs de partidas ya descargadas
+challenger_players = []  # Lista de jugadores a monitorear
+
+# Cliente LCU
+lcu_session = None
+lcu_base_url = None
+
+# === LOGGING ===
+def log(message, level="INFO"):
+    """Log con timestamp"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_msg = f"[{timestamp}] [{level}] {message}"
+    print(log_msg)
+    
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(log_msg + "\n")
+
+# === FUNCIONES LCU ===
+def get_lcu_credentials():
+    """Obtiene credenciales del cliente de LoL"""
+    for proc in psutil.process_iter(['name', 'cmdline']):
+        try:
+            if proc.info['name'] == 'LeagueClientUx.exe':
+                cmdline = proc.info['cmdline']
+                port = None
+                token = None
+                
+                for arg in cmdline:
+                    if '--app-port=' in arg:
+                        port = arg.split('=')[1]
+                    elif '--remoting-auth-token=' in arg:
+                        token = arg.split('=')[1]
+                
+                if port and token:
+                    return port, token
+        except:
+            continue
+    return None, None
+
+def init_lcu_session():
+    """Inicializa conexión con el cliente local"""
+    global lcu_session, lcu_base_url
+    
+    port, token = get_lcu_credentials()
+    
+    if not port or not token:
+        return False
+    
+    lcu_session = requests.Session()
+    auth = base64.b64encode(f"riot:{token}".encode()).decode()
+    lcu_session.headers.update({
+        'Authorization': f'Basic {auth}',
+        'Content-Type': 'application/json'
+    })
+    lcu_session.verify = False
+    lcu_base_url = f"https://127.0.0.1:{port}"
+    
+    # Verificar conexión
+    try:
+        r = lcu_session.get(f"{lcu_base_url}/lol-summoner/v1/current-summoner", timeout=5)
+        if r.status_code == 200:
+            summoner = r.json()
+            log(f"✅ Conectado al cliente como: {summoner['displayName']}")
+            return True
+    except:
+        pass
+    
+    return False
+
+# === FUNCIONES API RIOT ===
+def get_summoner_name_from_puuid(puuid):
+    """Obtiene el nombre del invocador desde su PUUID"""
+    url = f"https://{REGION_PLATFORM}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{puuid}"
+    headers = {"X-Riot-Token": API_KEY}
+    
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("name", "Unknown")
+    except:
+        pass
+    return "Unknown"
+
+def get_challenger_list():
+    """Obtiene lista de jugadores Challenger"""
+    log("Actualizando lista de Challengers...")
+    
+    url = f"https://{REGION_PLATFORM}.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5"
+    headers = {"X-Riot-Token": API_KEY}
+    
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        
+        entries = r.json()["entries"][:NUM_CHALLENGERS]
+        
+        players = []
+        for i, entry in enumerate(entries):
+            if "puuid" in entry:
+                puuid = entry["puuid"]
+                
+                # Obtener el nombre usando el PUUID
+                player_name = get_summoner_name_from_puuid(puuid)
+                
+                players.append({
+                    "puuid": puuid,
+                    "name": player_name,
+                    "lp": entry.get("leaguePoints", 0)
+                })
+                
+                # Log de progreso cada 10 jugadores
+                if (i + 1) % 10 == 0:
+                    log(f"  Procesados {i + 1}/{NUM_CHALLENGERS}...")
+                
+                # Rate limit
+                time.sleep(0.8)
+        
+        log(f"✅ {len(players)} Challengers cargados con nombres")
+        return players
+        
+    except Exception as e:
+        log(f"❌ Error obteniendo Challengers: {e}", "ERROR")
+        return []
+
+def check_active_game(puuid):
+    """Verifica si un jugador está en partida activa"""
+    url = f"https://{REGION_PLATFORM}.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/{puuid}"
+    headers = {"X-Riot-Token": API_KEY}
+    
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        elif r.status_code == 404:
+            return None  # No está en partida
+    except:
+        pass
+    return None
+
+def download_replay_lcu(game_id, region_code):
+    """Descarga replay usando LCU"""
+    if not lcu_session or not lcu_base_url:
+        log(f"⚠️  Cliente no conectado, no se puede descargar {game_id}", "WARN")
+        return False
+    
+    download_url = f"{lcu_base_url}/lol-replays/v1/rofls/{game_id}/download"
+    
+    payload = {
+        "componentType": "replay-button_match-history",
+        "gameId": int(game_id),
+        "platformId": region_code
+    }
+    
+    try:
+        response = lcu_session.post(download_url, json=payload, timeout=30)
+        
+        if response.status_code == 200:
+            log(f"✅ Descarga iniciada: {game_id}")
+            
+            # Esperar a que se complete
+            if wait_for_download(game_id):
+                copy_rofl_file(game_id)
+                return True
+            
+        elif response.status_code == 204:
+            log(f"⚠️  Replay no disponible todavía: {game_id}", "WARN")
+            return False
+        else:
+            log(f"❌ Error {response.status_code} descargando {game_id}", "ERROR")
+            return False
+            
+    except Exception as e:
+        log(f"❌ Excepción descargando {game_id}: {e}", "ERROR")
+        return False
+
+def wait_for_download(game_id, max_wait=120):
+    """Espera a que se complete la descarga"""
+    check_url = f"{lcu_base_url}/lol-replays/v1/rofls/{game_id}"
+    
+    waited = 0
+    while waited < max_wait:
+        try:
+            r = lcu_session.get(check_url, timeout=5)
+            
+            if r.status_code == 200:
+                data = r.json()
+                state = data.get('state', '')
+                
+                if state == 'ready':
+                    return True
+                elif state == 'downloading':
+                    progress = data.get('downloadProgress', 0)
+                    if waited % 10 == 0:  # Log cada 10 segundos
+                        log(f"  📊 Descargando {game_id}... {progress}%")
+        except:
+            pass
+        
+        time.sleep(2)
+        waited += 2
+    
+    return False
+
+def copy_rofl_file(game_id):
+    """Copia el archivo .rofl descargado"""
+    replays_dir = os.path.expanduser("~/Documents/League of Legends/Replays")
+    
+    if not os.path.exists(replays_dir):
+        log(f"⚠️  Carpeta de replays no encontrada", "WARN")
+        return
+    
+    for filename in os.listdir(replays_dir):
+        if str(game_id) in filename and filename.endswith('.rofl'):
+            src = os.path.join(replays_dir, filename)
+            dst = os.path.join(SAVE_PATH, filename)
+            
+            try:
+                import shutil
+                shutil.copy2(src, dst)
+                log(f"✅ Archivo guardado: {filename}")
+                
+                # Guardar metadata
+                save_metadata(game_id, filename)
+                return True
+            except Exception as e:
+                log(f"❌ Error copiando: {e}", "ERROR")
+                return False
+    
+    log(f"⚠️  Archivo .rofl no encontrado para {game_id}", "WARN")
+    return False
+
+def save_metadata(game_id, filename):
+    """Guarda información adicional del replay"""
+    metadata = {
+        "game_id": game_id,
+        "filename": filename,
+        "download_time": datetime.now().isoformat(),
+        "region": REGION_PLATFORM
+    }
+    
+    meta_path = os.path.join(SAVE_PATH, f"{game_id}_meta.json")
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+# === GESTIÓN DE PARTIDAS ===
+def monitor_game(game_id, puuid, player_name):
+    """Thread que monitorea una partida específica"""
+    log(f"🎮 Monitoreando partida: {game_id} ({player_name})")
+    
+    start_time = time.time()
+    
+    # Esperar a que termine la partida
+    while time.time() - start_time < MAX_WAIT_TIME * 60:
+        time.sleep(60)  # Revisar cada minuto
+        
+        # Verificar si sigue en partida
+        active = check_active_game(puuid)
+        
+        if active is None or active.get('gameId') != game_id:
+            # La partida terminó
+            elapsed = int((time.time() - start_time) / 60)
+            log(f"✅ Partida terminada: {game_id} (duró ~{elapsed} min)")
+            
+            # Esperar 2 minutos para que Riot procese
+            log(f"⏳ Esperando 2 min para que Riot procese el replay...")
+            time.sleep(120)
+            
+            # Intentar descargar
+            region_code = REGION_PLATFORM.upper()
+            
+            # Intentar hasta 3 veces
+            for attempt in range(3):
+                if download_replay_lcu(game_id, region_code):
+                    downloaded_games.add(game_id)
+                    log(f"🎉 REPLAY DESCARGADO: {game_id}")
+                    break
+                else:
+                    if attempt < 2:
+                        log(f"⏳ Reintento {attempt + 1}/3 en 1 minuto...")
+                        time.sleep(60)
+            else:
+                log(f"❌ No se pudo descargar {game_id} después de 3 intentos", "ERROR")
+            
+            # Remover de activos
+            if game_id in active_games:
+                del active_games[game_id]
+            
+            return
+    
+    log(f"⚠️  Timeout monitoreando {game_id}", "WARN")
+    if game_id in active_games:
+        del active_games[game_id]
+
+def monitoring_cycle():
+    """Un ciclo de monitoreo"""
+    log("\n" + "="*70)
+    log("🔍 CICLO DE MONITOREO")
+    log("="*70)
+    
+    new_games = 0
+    
+    for player in challenger_players:
+        puuid = player['puuid']
+        name = player['name']
+        
+        # Verificar si está en partida
+        game_info = check_active_game(puuid)
+        
+        if game_info:
+            game_id = game_info['gameId']
+            
+            # Si no la estamos monitoreando ya
+            if game_id not in active_games and game_id not in downloaded_games:
+                log(f"🆕 Nueva partida detectada: {game_id} ({name})")
+                
+                # Agregar a monitoreo
+                active_games[game_id] = {
+                    'puuid': puuid,
+                    'start_time': time.time(),
+                    'player_name': name
+                }
+                
+                # Iniciar thread de monitoreo (pasar puuid directamente)
+                thread = threading.Thread(
+                    target=monitor_game,
+                    args=(game_id, puuid, name),
+                    daemon=True
+                )
+                thread.start()
+                
+                new_games += 1
+        
+        time.sleep(0.5)  # Evitar rate limit
+    
+    log(f"✅ Ciclo completado. Nuevas partidas: {new_games}")
+    log(f"   Partidas activas: {len(active_games)}")
+    log(f"   Replays descargados: {len(downloaded_games)}")
+
+# === MAIN ===
+def main():
+    global challenger_players
+    
+    log("="*70)
+    log("🚀 MONITOR EN TIEMPO REAL - DESCARGA DE REPLAYS")
+    log("="*70)
+    
+    # Verificar cliente
+    log("\n[1/3] Conectando al cliente de LoL...")
+    if not init_lcu_session():
+        log("❌ Cliente de LoL no encontrado. Abre el cliente y reinicia.", "ERROR")
+        return
+    
+    # Cargar Challengers
+    log("\n[2/3] Cargando lista de Challengers...")
+    challenger_players = get_challenger_list()
+    
+    if not challenger_players:
+        log("❌ No se pudo cargar la lista de Challengers", "ERROR")
+        return
+    
+    # Mostrar top 5
+    log("\nTop 5 Challengers monitoreados:")
+    for i, p in enumerate(challenger_players[:5], 1):
+        log(f"  {i}. {p['name']} ({p['lp']} LP)")
+    
+    # Iniciar monitoreo
+    log(f"\n[3/3] Iniciando monitoreo continuo (cada {CHECK_INTERVAL}s)")
+    log("="*70)
+    log("Presiona Ctrl+C para detener\n")
+    
+    try:
+        cycle_count = 0
+        while True:
+            cycle_count += 1
+            log(f"\n>>> CICLO #{cycle_count} <<<")
+            
+            monitoring_cycle()
+            
+            # Actualizar lista de Challengers cada 10 ciclos
+            if cycle_count % 10 == 0:
+                log("\n🔄 Actualizando lista de Challengers...")
+                new_list = get_challenger_list()
+                if new_list:
+                    challenger_players = new_list
+            
+            # Esperar hasta el próximo ciclo
+            log(f"\n⏸️  Esperando {CHECK_INTERVAL} segundos...")
+            time.sleep(CHECK_INTERVAL)
+            
+    except KeyboardInterrupt:
+        log("\n⚠️  Deteniendo monitor...")
+        log(f"Total de replays descargados: {len(downloaded_games)}")
+        log("✅ Monitor detenido correctamente")
+
+if __name__ == "__main__":
+    main()[2025-11-06 00:27:42] [INFO] ======================================================================
+[2025-11-06 00:27:42] [INFO] 🚀 MONITOR EN TIEMPO REAL - DESCARGA DE REPLAYS
+[2025-11-06 00:27:42] [INFO] ======================================================================
+[2025-11-06 00:27:42] [INFO] 
+[1/3] Conectando al cliente de LoL...
+[2025-11-06 00:27:44] [INFO] ✅ Conectado al cliente como: 
+[2025-11-06 00:27:44] [INFO] 
+[2/3] Cargando lista de Challengers...
+[2025-11-06 00:27:44] [INFO] Actualizando lista de Challengers...
+[2025-11-06 00:27:53] [INFO]   Procesados 10/50...
+[2025-11-06 00:28:02] [INFO]   Procesados 20/50...
+[2025-11-06 00:28:11] [INFO]   Procesados 30/50...
+[2025-11-06 00:28:20] [INFO]   Procesados 40/50...
+[2025-11-06 00:28:29] [INFO]   Procesados 50/50...
+[2025-11-06 00:28:30] [INFO] ✅ 50 Challengers cargados con nombres
+[2025-11-06 00:28:30] [INFO] 
+Top 5 Challengers monitoreados:
+[2025-11-06 00:28:30] [INFO]   1. Unknown (2013 LP)
+[2025-11-06 00:28:30] [INFO]   2. Unknown (1957 LP)
+[2025-11-06 00:28:30] [INFO]   3. Unknown (1933 LP)
+[2025-11-06 00:28:30] [INFO]   4. Unknown (1874 LP)
+[2025-11-06 00:28:30] [INFO]   5. Unknown (1832 LP)
+[2025-11-06 00:28:30] [INFO] 
+[3/3] Iniciando monitoreo continuo (cada 180s)
+[2025-11-06 00:28:30] [INFO] ======================================================================
+[2025-11-06 00:28:30] [INFO] Presiona Ctrl+C para detener
+
+[2025-11-06 00:28:30] [INFO] 
+>>> CICLO #1 <<<
+[2025-11-06 00:28:30] [INFO] 
+======================================================================
+[2025-11-06 00:28:30] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 00:28:30] [INFO] ======================================================================
+[2025-11-06 00:28:52] [INFO] 🆕 Nueva partida detectada: 7593682464 (Unknown)
+[2025-11-06 00:28:52] [INFO] 🎮 Monitoreando partida: 7593682464 (Unknown)
+[2025-11-06 00:28:53] [INFO] 🆕 Nueva partida detectada: 7593692094 (Unknown)
+[2025-11-06 00:28:53] [INFO] 🎮 Monitoreando partida: 7593692094 (Unknown)
+[2025-11-06 00:29:01] [INFO] ✅ Ciclo completado. Nuevas partidas: 2
+[2025-11-06 00:29:01] [INFO]    Partidas activas: 2
+[2025-11-06 00:29:01] [INFO]    Replays descargados: 0
+[2025-11-06 00:29:01] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 00:29:52] [INFO] ✅ Partida terminada: 7593682464 (duró ~1 min)
+[2025-11-06 00:29:52] [INFO] ⏳ Esperando 2 min para que Riot procese el replay...
+[2025-11-06 00:31:52] [WARN] ⚠️  Replay no disponible todavía: 7593682464
+[2025-11-06 00:31:52] [INFO] ⏳ Reintento 1/3 en 1 minuto...
+[2025-11-06 00:32:01] [INFO] 
+>>> CICLO #2 <<<
+[2025-11-06 00:32:01] [INFO] 
+======================================================================
+[2025-11-06 00:32:01] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 00:32:01] [INFO] ======================================================================
+[2025-11-06 00:32:31] [INFO] ✅ Ciclo completado. Nuevas partidas: 0
+[2025-11-06 00:32:31] [INFO]    Partidas activas: 2
+[2025-11-06 00:32:31] [INFO]    Replays descargados: 0
+[2025-11-06 00:32:31] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 00:32:52] [WARN] ⚠️  Replay no disponible todavía: 7593682464
+[2025-11-06 00:32:52] [INFO] ⏳ Reintento 2/3 en 1 minuto...
+[2025-11-06 00:32:54] [INFO] ✅ Partida terminada: 7593692094 (duró ~4 min)
+[2025-11-06 00:32:54] [INFO] ⏳ Esperando 2 min para que Riot procese el replay...
+[2025-11-06 00:33:52] [WARN] ⚠️  Replay no disponible todavía: 7593682464
+[2025-11-06 00:33:52] [ERROR] ❌ No se pudo descargar 7593682464 después de 3 intentos
+[2025-11-06 00:34:54] [WARN] ⚠️  Replay no disponible todavía: 7593692094
+[2025-11-06 00:34:54] [INFO] ⏳ Reintento 1/3 en 1 minuto...
+[2025-11-06 00:35:31] [INFO] 
+⚠️  Deteniendo monitor...
+[2025-11-06 00:35:31] [INFO] Total de replays descargados: 0
+[2025-11-06 00:35:31] [INFO] ✅ Monitor detenido correctamente
+[2025-11-06 00:35:40] [INFO] ======================================================================
+[2025-11-06 00:35:40] [INFO] 🚀 MONITOR EN TIEMPO REAL - DESCARGA DE REPLAYS
+[2025-11-06 00:35:40] [INFO] ======================================================================
+[2025-11-06 00:35:40] [INFO] 
+[1/3] Conectando al cliente de LoL...
+[2025-11-06 00:35:42] [INFO] ✅ Conectado al cliente como: 
+[2025-11-06 00:35:42] [INFO] 
+[2/3] Cargando lista de Challengers...
+[2025-11-06 00:35:42] [INFO] Actualizando lista de Challengers...
+[2025-11-06 00:35:51] [INFO]   Procesados 10/50...
+[2025-11-06 00:36:00] [INFO]   Procesados 20/50...
+[2025-11-06 00:36:09] [INFO]   Procesados 30/50...
+[2025-11-06 00:36:18] [INFO]   Procesados 40/50...
+[2025-11-06 00:36:27] [INFO]   Procesados 50/50...
+[2025-11-06 00:36:28] [INFO] ✅ 50 Challengers cargados con nombres
+[2025-11-06 00:36:28] [INFO] 
+Top 5 Challengers monitoreados:
+[2025-11-06 00:36:28] [INFO]   1. Unknown (2013 LP)
+[2025-11-06 00:36:28] [INFO]   2. Unknown (1957 LP)
+[2025-11-06 00:36:28] [INFO]   3. Unknown (1933 LP)
+[2025-11-06 00:36:28] [INFO]   4. Unknown (1874 LP)
+[2025-11-06 00:36:28] [INFO]   5. Unknown (1832 LP)
+[2025-11-06 00:36:28] [INFO] 
+[3/3] Iniciando monitoreo continuo (cada 180s)
+[2025-11-06 00:36:28] [INFO] ======================================================================
+[2025-11-06 00:36:28] [INFO] Presiona Ctrl+C para detener
+
+[2025-11-06 00:36:28] [INFO] 
+>>> CICLO #1 <<<
+[2025-11-06 00:36:28] [INFO] 
+======================================================================
+[2025-11-06 00:36:28] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 00:36:28] [INFO] ======================================================================
+[2025-11-06 00:36:56] [INFO] 🆕 Nueva partida detectada: 7593717935 (Unknown)
+[2025-11-06 00:36:56] [INFO] 🎮 Monitoreando partida: 7593717935 (Unknown)
+[2025-11-06 00:36:58] [INFO] ✅ Ciclo completado. Nuevas partidas: 1
+[2025-11-06 00:36:58] [INFO]    Partidas activas: 1
+[2025-11-06 00:36:58] [INFO]    Replays descargados: 0
+[2025-11-06 00:36:58] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 00:39:58] [INFO] 
+>>> CICLO #2 <<<
+[2025-11-06 00:39:58] [INFO] 
+======================================================================
+[2025-11-06 00:39:58] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 00:39:58] [INFO] ======================================================================
+[2025-11-06 00:40:28] [INFO] ✅ Ciclo completado. Nuevas partidas: 0
+[2025-11-06 00:40:28] [INFO]    Partidas activas: 1
+[2025-11-06 00:40:28] [INFO]    Replays descargados: 0
+[2025-11-06 00:40:28] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 00:43:28] [INFO] 
+>>> CICLO #3 <<<
+[2025-11-06 00:43:28] [INFO] 
+======================================================================
+[2025-11-06 00:43:28] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 00:43:28] [INFO] ======================================================================
+[2025-11-06 00:43:34] [INFO] 🆕 Nueva partida detectada: 7593720233 (Unknown)
+[2025-11-06 00:43:34] [INFO] 🎮 Monitoreando partida: 7593720233 (Unknown)
+[2025-11-06 00:43:59] [INFO] ✅ Ciclo completado. Nuevas partidas: 1
+[2025-11-06 00:43:59] [INFO]    Partidas activas: 2
+[2025-11-06 00:43:59] [INFO]    Replays descargados: 0
+[2025-11-06 00:43:59] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 00:46:59] [INFO] 
+>>> CICLO #4 <<<
+[2025-11-06 00:46:59] [INFO] 
+======================================================================
+[2025-11-06 00:46:59] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 00:46:59] [INFO] ======================================================================
+[2025-11-06 00:47:29] [INFO] ✅ Ciclo completado. Nuevas partidas: 0
+[2025-11-06 00:47:29] [INFO]    Partidas activas: 2
+[2025-11-06 00:47:29] [INFO]    Replays descargados: 0
+[2025-11-06 00:47:29] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 00:50:29] [INFO] 
+>>> CICLO #5 <<<
+[2025-11-06 00:50:29] [INFO] 
+======================================================================
+[2025-11-06 00:50:29] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 00:50:29] [INFO] ======================================================================
+[2025-11-06 00:50:42] [INFO] 🆕 Nueva partida detectada: 7593726227 (Unknown)
+[2025-11-06 00:50:42] [INFO] 🎮 Monitoreando partida: 7593726227 (Unknown)
+[2025-11-06 00:51:00] [INFO] ✅ Ciclo completado. Nuevas partidas: 1
+[2025-11-06 00:51:00] [INFO]    Partidas activas: 3
+[2025-11-06 00:51:00] [INFO]    Replays descargados: 0
+[2025-11-06 00:51:00] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 00:54:00] [INFO] 
+>>> CICLO #6 <<<
+[2025-11-06 00:54:00] [INFO] 
+======================================================================
+[2025-11-06 00:54:00] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 00:54:00] [INFO] ======================================================================
+[2025-11-06 00:54:30] [INFO] ✅ Ciclo completado. Nuevas partidas: 0
+[2025-11-06 00:54:30] [INFO]    Partidas activas: 3
+[2025-11-06 00:54:30] [INFO]    Replays descargados: 0
+[2025-11-06 00:54:30] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 00:57:30] [INFO] 
+>>> CICLO #7 <<<
+[2025-11-06 00:57:30] [INFO] 
+======================================================================
+[2025-11-06 00:57:30] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 00:57:30] [INFO] ======================================================================
+[2025-11-06 00:58:01] [INFO] ✅ Ciclo completado. Nuevas partidas: 0
+[2025-11-06 00:58:01] [INFO]    Partidas activas: 3
+[2025-11-06 00:58:01] [INFO]    Replays descargados: 0
+[2025-11-06 00:58:01] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:01:01] [INFO] 
+>>> CICLO #8 <<<
+[2025-11-06 01:01:01] [INFO] 
+======================================================================
+[2025-11-06 01:01:01] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:01:01] [INFO] ======================================================================
+[2025-11-06 01:01:32] [INFO] ✅ Ciclo completado. Nuevas partidas: 0
+[2025-11-06 01:01:32] [INFO]    Partidas activas: 3
+[2025-11-06 01:01:32] [INFO]    Replays descargados: 0
+[2025-11-06 01:01:32] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:04:32] [INFO] 
+>>> CICLO #9 <<<
+[2025-11-06 01:04:32] [INFO] 
+======================================================================
+[2025-11-06 01:04:32] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:04:32] [INFO] ======================================================================
+[2025-11-06 01:04:43] [INFO] ✅ Partida terminada: 7593726227 (duró ~14 min)
+[2025-11-06 01:04:43] [INFO] ⏳ Esperando 2 min para que Riot procese el replay...
+[2025-11-06 01:05:02] [INFO] ✅ Ciclo completado. Nuevas partidas: 0
+[2025-11-06 01:05:02] [INFO]    Partidas activas: 3
+[2025-11-06 01:05:02] [INFO]    Replays descargados: 0
+[2025-11-06 01:05:02] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:05:05] [INFO] ✅ Partida terminada: 7593717935 (duró ~28 min)
+[2025-11-06 01:05:05] [INFO] ⏳ Esperando 2 min para que Riot procese el replay...
+[2025-11-06 01:06:43] [WARN] ⚠️  Replay no disponible todavía: 7593726227
+[2025-11-06 01:06:43] [INFO] ⏳ Reintento 1/3 en 1 minuto...
+[2025-11-06 01:07:05] [WARN] ⚠️  Replay no disponible todavía: 7593717935
+[2025-11-06 01:07:05] [INFO] ⏳ Reintento 1/3 en 1 minuto...
+[2025-11-06 01:07:43] [WARN] ⚠️  Replay no disponible todavía: 7593726227
+[2025-11-06 01:07:43] [INFO] ⏳ Reintento 2/3 en 1 minuto...
+[2025-11-06 01:08:02] [INFO] 
+>>> CICLO #10 <<<
+[2025-11-06 01:08:02] [INFO] 
+======================================================================
+[2025-11-06 01:08:02] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:08:02] [INFO] ======================================================================
+[2025-11-06 01:08:05] [WARN] ⚠️  Replay no disponible todavía: 7593717935
+[2025-11-06 01:08:05] [INFO] ⏳ Reintento 2/3 en 1 minuto...
+[2025-11-06 01:08:32] [INFO] ✅ Ciclo completado. Nuevas partidas: 0
+[2025-11-06 01:08:32] [INFO]    Partidas activas: 3
+[2025-11-06 01:08:32] [INFO]    Replays descargados: 0
+[2025-11-06 01:08:32] [INFO] 
+🔄 Actualizando lista de Challengers...
+[2025-11-06 01:08:32] [INFO] Actualizando lista de Challengers...
+[2025-11-06 01:08:40] [INFO]   Procesados 10/50...
+[2025-11-06 01:08:43] [WARN] ⚠️  Replay no disponible todavía: 7593726227
+[2025-11-06 01:08:43] [ERROR] ❌ No se pudo descargar 7593726227 después de 3 intentos
+[2025-11-06 01:08:49] [INFO]   Procesados 20/50...
+[2025-11-06 01:08:59] [INFO]   Procesados 30/50...
+[2025-11-06 01:09:05] [WARN] ⚠️  Replay no disponible todavía: 7593717935
+[2025-11-06 01:09:05] [ERROR] ❌ No se pudo descargar 7593717935 después de 3 intentos
+[2025-11-06 01:09:08] [INFO]   Procesados 40/50...
+[2025-11-06 01:09:10] [INFO] 
+⚠️  Deteniendo monitor...
+[2025-11-06 01:09:10] [INFO] Total de replays descargados: 0
+[2025-11-06 01:09:10] [INFO] ✅ Monitor detenido correctamente
+[2025-11-06 01:13:07] [INFO] ======================================================================
+[2025-11-06 01:13:07] [INFO] 🚀 MONITOR EN TIEMPO REAL - DESCARGA DE REPLAYS
+[2025-11-06 01:13:07] [INFO] ======================================================================
+[2025-11-06 01:13:07] [INFO] 
+[1/3] Conectando al cliente de LoL...
+[2025-11-06 01:13:09] [INFO] ✅ Conectado al cliente como: 
+[2025-11-06 01:13:09] [INFO] 
+[2/3] Cargando lista de Challengers...
+[2025-11-06 01:13:09] [INFO] Actualizando lista de Challengers...
+[2025-11-06 01:13:18] [INFO]   Procesados 10/50...
+[2025-11-06 01:13:27] [INFO]   Procesados 20/50...
+[2025-11-06 01:13:36] [INFO]   Procesados 30/50...
+[2025-11-06 01:13:45] [INFO]   Procesados 40/50...
+[2025-11-06 01:13:54] [INFO]   Procesados 50/50...
+[2025-11-06 01:13:55] [INFO] ✅ 50 Challengers cargados con nombres
+[2025-11-06 01:13:55] [INFO] 
+Top 5 Challengers monitoreados:
+[2025-11-06 01:13:55] [INFO]   1. The Face Farter#EUW (2013 LP)
+[2025-11-06 01:13:55] [INFO]   2. TwTv LadicusVibe#Vayne (1957 LP)
+[2025-11-06 01:13:55] [INFO]   3. Nano#IRE (1933 LP)
+[2025-11-06 01:13:55] [INFO]   4. Thayger#SOUL (1874 LP)
+[2025-11-06 01:13:55] [INFO]   5. Mαster Oogwαy#EUW (1832 LP)
+[2025-11-06 01:13:55] [INFO] 
+[3/3] Iniciando monitoreo continuo (cada 180s)
+[2025-11-06 01:13:55] [INFO] ======================================================================
+[2025-11-06 01:13:55] [INFO] Presiona Ctrl+C para detener
+
+[2025-11-06 01:13:55] [INFO] 
+>>> CICLO #1 <<<
+[2025-11-06 01:13:55] [INFO] 
+======================================================================
+[2025-11-06 01:13:55] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:13:55] [INFO] ======================================================================
+[2025-11-06 01:14:26] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-06 01:14:26] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 01:14:26] [INFO]    Partidas activas monitoreando: 0
+[2025-11-06 01:14:26] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:14:26] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:17:26] [INFO] 
+>>> CICLO #2 <<<
+[2025-11-06 01:17:26] [INFO] 
+======================================================================
+[2025-11-06 01:17:26] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:17:26] [INFO] ======================================================================
+[2025-11-06 01:17:56] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-06 01:17:56] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 01:17:56] [INFO]    Partidas activas monitoreando: 0
+[2025-11-06 01:17:56] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:17:56] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:20:56] [INFO] 
+>>> CICLO #3 <<<
+[2025-11-06 01:20:56] [INFO] 
+======================================================================
+[2025-11-06 01:20:56] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:20:56] [INFO] ======================================================================
+[2025-11-06 01:21:27] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-06 01:21:27] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 01:21:27] [INFO]    Partidas activas monitoreando: 0
+[2025-11-06 01:21:27] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:21:27] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:22:07] [INFO] 
+⚠️  Deteniendo monitor...
+[2025-11-06 01:22:07] [INFO] Total de replays descargados: 0
+[2025-11-06 01:22:07] [INFO] ✅ Monitor detenido correctamente
+[2025-11-06 01:22:10] [INFO] ======================================================================
+[2025-11-06 01:22:10] [INFO] 🚀 MONITOR EN TIEMPO REAL - DESCARGA DE REPLAYS
+[2025-11-06 01:22:10] [INFO] ======================================================================
+[2025-11-06 01:22:10] [INFO] 
+[1/3] Conectando al cliente de LoL...
+[2025-11-06 01:22:12] [INFO] ✅ Conectado al cliente como: 
+[2025-11-06 01:22:12] [INFO] 
+[2/3] Cargando lista de Challengers...
+[2025-11-06 01:22:12] [INFO] Actualizando lista de Challengers...
+[2025-11-06 01:22:21] [INFO]   Procesados 10/50...
+[2025-11-06 01:22:30] [INFO]   Procesados 20/50...
+[2025-11-06 01:22:39] [INFO]   Procesados 30/50...
+[2025-11-06 01:22:48] [INFO]   Procesados 40/50...
+[2025-11-06 01:22:57] [INFO]   Procesados 50/50...
+[2025-11-06 01:22:58] [INFO] ✅ 50 Challengers cargados con nombres
+[2025-11-06 01:22:58] [INFO] 
+Top 5 Challengers monitoreados:
+[2025-11-06 01:22:58] [INFO]   1. The Face Farter#EUW (2013 LP)
+[2025-11-06 01:22:58] [INFO]   2. TwTv LadicusVibe#Vayne (1957 LP)
+[2025-11-06 01:22:58] [INFO]   3. Nano#IRE (1933 LP)
+[2025-11-06 01:22:58] [INFO]   4. Thayger#SOUL (1874 LP)
+[2025-11-06 01:22:58] [INFO]   5. Mαster Oogwαy#EUW (1832 LP)
+[2025-11-06 01:22:58] [INFO] 
+[3/3] Iniciando monitoreo continuo (cada 180s)
+[2025-11-06 01:22:58] [INFO] ======================================================================
+[2025-11-06 01:22:58] [INFO] Presiona Ctrl+C para detener
+
+[2025-11-06 01:22:58] [INFO] 
+>>> CICLO #1 <<<
+[2025-11-06 01:22:58] [INFO] 
+======================================================================
+[2025-11-06 01:22:58] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:22:58] [INFO] ======================================================================
+[2025-11-06 01:23:28] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-06 01:23:28] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 01:23:28] [INFO]    Partidas activas monitoreando: 0
+[2025-11-06 01:23:28] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:23:28] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:26:28] [INFO] 
+>>> CICLO #2 <<<
+[2025-11-06 01:26:28] [INFO] 
+======================================================================
+[2025-11-06 01:26:28] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:26:28] [INFO] ======================================================================
+[2025-11-06 01:26:59] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-06 01:26:59] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 01:26:59] [INFO]    Partidas activas monitoreando: 0
+[2025-11-06 01:26:59] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:26:59] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:29:59] [INFO] 
+>>> CICLO #3 <<<
+[2025-11-06 01:29:59] [INFO] 
+======================================================================
+[2025-11-06 01:29:59] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:29:59] [INFO] ======================================================================
+[2025-11-06 01:30:16] [INFO] 🆕 Nueva partida detectada: 7593752914 ( Nothing much#EUW) - En curso hace 1 min
+[2025-11-06 01:30:16] [INFO] 🎮 Monitoreando partida: 7593752914 ( Nothing much#EUW)
+[2025-11-06 01:30:30] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 01:30:30] [INFO]    Nuevas partidas monitoreadas: 1
+[2025-11-06 01:30:30] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 01:30:30] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:30:30] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:33:30] [INFO] 
+>>> CICLO #4 <<<
+[2025-11-06 01:33:30] [INFO] 
+======================================================================
+[2025-11-06 01:33:30] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:33:30] [INFO] ======================================================================
+[2025-11-06 01:34:02] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 01:34:02] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 01:34:02] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 01:34:02] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:34:02] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:37:02] [INFO] 
+>>> CICLO #5 <<<
+[2025-11-06 01:37:02] [INFO] 
+======================================================================
+[2025-11-06 01:37:02] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:37:02] [INFO] ======================================================================
+[2025-11-06 01:37:32] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 01:37:32] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 01:37:32] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 01:37:32] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:37:32] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:40:32] [INFO] 
+>>> CICLO #6 <<<
+[2025-11-06 01:40:32] [INFO] 
+======================================================================
+[2025-11-06 01:40:32] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:40:32] [INFO] ======================================================================
+[2025-11-06 01:41:02] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 01:41:02] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 01:41:02] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 01:41:02] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:41:02] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:44:02] [INFO] 
+>>> CICLO #7 <<<
+[2025-11-06 01:44:02] [INFO] 
+======================================================================
+[2025-11-06 01:44:02] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:44:02] [INFO] ======================================================================
+[2025-11-06 01:44:33] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 01:44:33] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 01:44:33] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 01:44:33] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:44:33] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:47:33] [INFO] 
+>>> CICLO #8 <<<
+[2025-11-06 01:47:33] [INFO] 
+======================================================================
+[2025-11-06 01:47:33] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:47:33] [INFO] ======================================================================
+[2025-11-06 01:48:03] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 01:48:03] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 01:48:03] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 01:48:03] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:48:03] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:51:03] [INFO] 
+>>> CICLO #9 <<<
+[2025-11-06 01:51:03] [INFO] 
+======================================================================
+[2025-11-06 01:51:03] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:51:03] [INFO] ======================================================================
+[2025-11-06 01:51:34] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 01:51:34] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 01:51:34] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 01:51:34] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:51:34] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:54:34] [INFO] 
+>>> CICLO #10 <<<
+[2025-11-06 01:54:34] [INFO] 
+======================================================================
+[2025-11-06 01:54:34] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:54:34] [INFO] ======================================================================
+[2025-11-06 01:55:04] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 01:55:04] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 01:55:04] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 01:55:04] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:55:04] [INFO] 
+🔄 Actualizando lista de Challengers...
+[2025-11-06 01:55:04] [INFO] Actualizando lista de Challengers...
+[2025-11-06 01:55:13] [INFO]   Procesados 10/50...
+[2025-11-06 01:55:22] [INFO]   Procesados 20/50...
+[2025-11-06 01:55:31] [INFO]   Procesados 30/50...
+[2025-11-06 01:55:40] [INFO]   Procesados 40/50...
+[2025-11-06 01:55:49] [INFO]   Procesados 50/50...
+[2025-11-06 01:55:50] [INFO] ✅ 50 Challengers cargados con nombres
+[2025-11-06 01:55:50] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 01:58:50] [INFO] 
+>>> CICLO #11 <<<
+[2025-11-06 01:58:50] [INFO] 
+======================================================================
+[2025-11-06 01:58:50] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 01:58:50] [INFO] ======================================================================
+[2025-11-06 01:59:21] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 01:59:21] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 01:59:21] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 01:59:21] [INFO]    Replays descargados (total): 0
+[2025-11-06 01:59:21] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:02:21] [INFO] 
+>>> CICLO #12 <<<
+[2025-11-06 02:02:21] [INFO] 
+======================================================================
+[2025-11-06 02:02:21] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:02:21] [INFO] ======================================================================
+[2025-11-06 02:02:50] [INFO] 🆕 Nueva partida detectada: 7593771548 (molodoy jg#FURIA) - En curso hace 3 min
+[2025-11-06 02:02:50] [INFO] 🎮 Monitoreando partida: 7593771548 (molodoy jg#FURIA)
+[2025-11-06 02:02:51] [INFO] ✅ Ciclo completado. En partida ahora: 3
+[2025-11-06 02:02:51] [INFO]    Nuevas partidas monitoreadas: 1
+[2025-11-06 02:02:51] [INFO]    Partidas activas monitoreando: 2
+[2025-11-06 02:02:51] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:02:51] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:05:51] [INFO] 
+>>> CICLO #13 <<<
+[2025-11-06 02:05:51] [INFO] 
+======================================================================
+[2025-11-06 02:05:51] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:05:51] [INFO] ======================================================================
+[2025-11-06 02:06:22] [INFO] ✅ Ciclo completado. En partida ahora: 3
+[2025-11-06 02:06:22] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:06:22] [INFO]    Partidas activas monitoreando: 2
+[2025-11-06 02:06:22] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:06:22] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:08:28] [INFO] ✅ Partida terminada: 7593752914 (duró ~38 min)
+[2025-11-06 02:08:28] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-06 02:09:22] [INFO] 
+>>> CICLO #14 <<<
+[2025-11-06 02:09:22] [INFO] 
+======================================================================
+[2025-11-06 02:09:22] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:09:22] [INFO] ======================================================================
+[2025-11-06 02:09:53] [INFO] ✅ Ciclo completado. En partida ahora: 1
+[2025-11-06 02:09:53] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:09:53] [INFO]    Partidas activas monitoreando: 2
+[2025-11-06 02:09:53] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:09:53] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:11:28] [WARN] ⚠️  Replay no disponible todavía: 7593752914
+[2025-11-06 02:11:28] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-06 02:12:53] [INFO] 
+>>> CICLO #15 <<<
+[2025-11-06 02:12:53] [INFO] 
+======================================================================
+[2025-11-06 02:12:53] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:12:53] [INFO] ======================================================================
+[2025-11-06 02:12:58] [WARN] ⚠️  Replay no disponible todavía: 7593752914
+[2025-11-06 02:12:58] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-06 02:13:23] [INFO] ✅ Ciclo completado. En partida ahora: 1
+[2025-11-06 02:13:23] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:13:23] [INFO]    Partidas activas monitoreando: 2
+[2025-11-06 02:13:23] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:13:23] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:14:28] [WARN] ⚠️  Replay no disponible todavía: 7593752914
+[2025-11-06 02:14:28] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-06 02:15:53] [INFO] ✅ Partida terminada: 7593771548 (duró ~13 min)
+[2025-11-06 02:15:53] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-06 02:15:58] [WARN] ⚠️  Replay no disponible todavía: 7593752914
+[2025-11-06 02:15:58] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-06 02:16:23] [INFO] 
+>>> CICLO #16 <<<
+[2025-11-06 02:16:23] [INFO] 
+======================================================================
+[2025-11-06 02:16:23] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:16:23] [INFO] ======================================================================
+[2025-11-06 02:16:54] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-06 02:16:54] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:16:54] [INFO]    Partidas activas monitoreando: 2
+[2025-11-06 02:16:54] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:16:54] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:17:28] [WARN] ⚠️  Replay no disponible todavía: 7593752914
+[2025-11-06 02:17:28] [ERROR] ❌ No se pudo descargar 7593752914 después de 5 intentos
+[2025-11-06 02:17:28] [ERROR]    Posibles razones:
+[2025-11-06 02:17:28] [ERROR]    - Partida de patch antiguo
+[2025-11-06 02:17:28] [ERROR]    - Riot no guardó el replay
+[2025-11-06 02:17:28] [ERROR]    - Replay expiró (>48h)
+[2025-11-06 02:18:53] [WARN] ⚠️  Replay no disponible todavía: 7593771548
+[2025-11-06 02:18:53] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-06 02:19:54] [INFO] 
+>>> CICLO #17 <<<
+[2025-11-06 02:19:54] [INFO] 
+======================================================================
+[2025-11-06 02:19:54] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:19:54] [INFO] ======================================================================
+[2025-11-06 02:20:23] [WARN] ⚠️  Replay no disponible todavía: 7593771548
+[2025-11-06 02:20:23] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-06 02:20:25] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-06 02:20:25] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:20:25] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 02:20:25] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:20:25] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:21:53] [WARN] ⚠️  Replay no disponible todavía: 7593771548
+[2025-11-06 02:21:53] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-06 02:23:23] [WARN] ⚠️  Replay no disponible todavía: 7593771548
+[2025-11-06 02:23:23] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-06 02:23:25] [INFO] 
+>>> CICLO #18 <<<
+[2025-11-06 02:23:25] [INFO] 
+======================================================================
+[2025-11-06 02:23:25] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:23:25] [INFO] ======================================================================
+[2025-11-06 02:23:55] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-06 02:23:55] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:23:55] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 02:23:55] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:23:55] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:24:53] [WARN] ⚠️  Replay no disponible todavía: 7593771548
+[2025-11-06 02:24:53] [ERROR] ❌ No se pudo descargar 7593771548 después de 5 intentos
+[2025-11-06 02:24:53] [ERROR]    Posibles razones:
+[2025-11-06 02:24:53] [ERROR]    - Partida de patch antiguo
+[2025-11-06 02:24:53] [ERROR]    - Riot no guardó el replay
+[2025-11-06 02:24:53] [ERROR]    - Replay expiró (>48h)
+[2025-11-06 02:26:55] [INFO] 
+>>> CICLO #19 <<<
+[2025-11-06 02:26:55] [INFO] 
+======================================================================
+[2025-11-06 02:26:55] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:26:55] [INFO] ======================================================================
+[2025-11-06 02:27:26] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-06 02:27:26] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:27:26] [INFO]    Partidas activas monitoreando: 0
+[2025-11-06 02:27:26] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:27:26] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:30:26] [INFO] 
+>>> CICLO #20 <<<
+[2025-11-06 02:30:26] [INFO] 
+======================================================================
+[2025-11-06 02:30:26] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:30:26] [INFO] ======================================================================
+[2025-11-06 02:30:43] [INFO] 🆕 Nueva partida detectada: 7593785581 ( Nothing much#EUW) - En curso hace 1 min
+[2025-11-06 02:30:43] [INFO] 🎮 Monitoreando partida: 7593785581 ( Nothing much#EUW)
+[2025-11-06 02:30:57] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 02:30:57] [INFO]    Nuevas partidas monitoreadas: 1
+[2025-11-06 02:30:57] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 02:30:57] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:30:57] [INFO] 
+🔄 Actualizando lista de Challengers...
+[2025-11-06 02:30:57] [INFO] Actualizando lista de Challengers...
+[2025-11-06 02:31:05] [INFO]   Procesados 10/50...
+[2025-11-06 02:31:14] [INFO]   Procesados 20/50...
+[2025-11-06 02:31:24] [INFO]   Procesados 30/50...
+[2025-11-06 02:31:33] [INFO]   Procesados 40/50...
+[2025-11-06 02:31:42] [INFO]   Procesados 50/50...
+[2025-11-06 02:31:43] [INFO] ✅ 50 Challengers cargados con nombres
+[2025-11-06 02:31:43] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:34:43] [INFO] 
+>>> CICLO #21 <<<
+[2025-11-06 02:34:43] [INFO] 
+======================================================================
+[2025-11-06 02:34:43] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:34:43] [INFO] ======================================================================
+[2025-11-06 02:35:13] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 02:35:13] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:35:13] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 02:35:13] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:35:13] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:38:13] [INFO] 
+>>> CICLO #22 <<<
+[2025-11-06 02:38:13] [INFO] 
+======================================================================
+[2025-11-06 02:38:13] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:38:13] [INFO] ======================================================================
+[2025-11-06 02:38:44] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 02:38:44] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:38:44] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 02:38:44] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:38:44] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:41:44] [INFO] 
+>>> CICLO #23 <<<
+[2025-11-06 02:41:44] [INFO] 
+======================================================================
+[2025-11-06 02:41:44] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:41:44] [INFO] ======================================================================
+[2025-11-06 02:42:14] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 02:42:14] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:42:14] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 02:42:14] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:42:14] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:45:14] [INFO] 
+>>> CICLO #24 <<<
+[2025-11-06 02:45:14] [INFO] 
+======================================================================
+[2025-11-06 02:45:14] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:45:14] [INFO] ======================================================================
+[2025-11-06 02:45:45] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 02:45:45] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:45:45] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 02:45:45] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:45:45] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:48:45] [INFO] 
+>>> CICLO #25 <<<
+[2025-11-06 02:48:45] [INFO] 
+======================================================================
+[2025-11-06 02:48:45] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:48:45] [INFO] ======================================================================
+[2025-11-06 02:49:20] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 02:49:20] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:49:20] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 02:49:20] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:49:20] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:52:20] [INFO] 
+>>> CICLO #26 <<<
+[2025-11-06 02:52:20] [INFO] 
+======================================================================
+[2025-11-06 02:52:20] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:52:20] [INFO] ======================================================================
+[2025-11-06 02:52:50] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 02:52:50] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:52:50] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 02:52:50] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:52:50] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:55:50] [INFO] 
+>>> CICLO #27 <<<
+[2025-11-06 02:55:50] [INFO] 
+======================================================================
+[2025-11-06 02:55:50] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:55:50] [INFO] ======================================================================
+[2025-11-06 02:56:21] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 02:56:21] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:56:21] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 02:56:21] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:56:21] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 02:59:21] [INFO] 
+>>> CICLO #28 <<<
+[2025-11-06 02:59:21] [INFO] 
+======================================================================
+[2025-11-06 02:59:21] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 02:59:21] [INFO] ======================================================================
+[2025-11-06 02:59:51] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-06 02:59:51] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 02:59:51] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 02:59:51] [INFO]    Replays descargados (total): 0
+[2025-11-06 02:59:51] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 03:01:53] [INFO] ✅ Partida terminada: 7593785581 (duró ~31 min)
+[2025-11-06 03:01:53] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-06 03:02:51] [INFO] 
+>>> CICLO #29 <<<
+[2025-11-06 03:02:51] [INFO] 
+======================================================================
+[2025-11-06 03:02:51] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 03:02:51] [INFO] ======================================================================
+[2025-11-06 03:03:24] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-06 03:03:24] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 03:03:24] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 03:03:24] [INFO]    Replays descargados (total): 0
+[2025-11-06 03:03:24] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 03:04:53] [WARN] ⚠️  Replay no disponible todavía: 7593785581
+[2025-11-06 03:04:53] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-06 03:06:23] [WARN] ⚠️  Replay no disponible todavía: 7593785581
+[2025-11-06 03:06:23] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-06 03:06:24] [INFO] 
+>>> CICLO #30 <<<
+[2025-11-06 03:06:24] [INFO] 
+======================================================================
+[2025-11-06 03:06:24] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 03:06:24] [INFO] ======================================================================
+[2025-11-06 03:06:54] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-06 03:06:54] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 03:06:54] [INFO]    Partidas activas monitoreando: 1
+[2025-11-06 03:06:54] [INFO]    Replays descargados (total): 0
+[2025-11-06 03:06:54] [INFO] 
+🔄 Actualizando lista de Challengers...
+[2025-11-06 03:06:54] [INFO] Actualizando lista de Challengers...
+[2025-11-06 03:07:03] [INFO]   Procesados 10/50...
+[2025-11-06 03:07:12] [INFO]   Procesados 20/50...
+[2025-11-06 03:07:21] [INFO]   Procesados 30/50...
+[2025-11-06 03:07:30] [INFO]   Procesados 40/50...
+[2025-11-06 03:07:39] [INFO]   Procesados 50/50...
+[2025-11-06 03:07:40] [INFO] ✅ 50 Challengers cargados con nombres
+[2025-11-06 03:07:40] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 03:07:53] [WARN] ⚠️  Replay no disponible todavía: 7593785581
+[2025-11-06 03:07:53] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-06 03:09:23] [WARN] ⚠️  Replay no disponible todavía: 7593785581
+[2025-11-06 03:09:23] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-06 03:10:40] [INFO] 
+>>> CICLO #31 <<<
+[2025-11-06 03:10:40] [INFO] 
+======================================================================
+[2025-11-06 03:10:40] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 03:10:40] [INFO] ======================================================================
+[2025-11-06 03:10:53] [WARN] ⚠️  Replay no disponible todavía: 7593785581
+[2025-11-06 03:10:53] [ERROR] ❌ No se pudo descargar 7593785581 después de 5 intentos
+[2025-11-06 03:10:53] [ERROR]    Posibles razones:
+[2025-11-06 03:10:53] [ERROR]    - Partida de patch antiguo
+[2025-11-06 03:10:53] [ERROR]    - Riot no guardó el replay
+[2025-11-06 03:10:53] [ERROR]    - Replay expiró (>48h)
+[2025-11-06 03:11:10] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-06 03:11:10] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-06 03:11:10] [INFO]    Partidas activas monitoreando: 0
+[2025-11-06 03:11:10] [INFO]    Replays descargados (total): 0
+[2025-11-06 03:11:10] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 03:11:52] [INFO] 
+⚠️  Deteniendo monitor...
+[2025-11-06 03:11:52] [INFO] Total de replays descargados: 0
+[2025-11-06 03:11:52] [INFO] ✅ Monitor detenido correctamente
+[2025-11-06 21:18:22] [INFO] ======================================================================
+[2025-11-06 21:18:22] [INFO] 🚀 MONITOR EN TIEMPO REAL - DESCARGA DE REPLAYS
+[2025-11-06 21:18:22] [INFO] ======================================================================
+[2025-11-06 21:18:22] [INFO] 
+[1/3] Conectando al cliente de LoL...
+[2025-11-06 21:18:27] [ERROR] ❌ Cliente de LoL no encontrado. Abre el cliente y reinicia.
+[2025-11-06 21:19:31] [INFO] ======================================================================
+[2025-11-06 21:19:31] [INFO] 🚀 MONITOR EN TIEMPO REAL - DESCARGA DE REPLAYS
+[2025-11-06 21:19:31] [INFO] ======================================================================
+[2025-11-06 21:19:31] [INFO] 
+[1/3] Conectando al cliente de LoL...
+[2025-11-06 21:19:31] [INFO] ✅ Conectado al cliente como: 
+[2025-11-06 21:19:31] [INFO] 
+[2/3] Cargando lista de Challengers...
+[2025-11-06 21:19:31] [INFO] Actualizando lista de Challengers...
+[2025-11-06 21:19:32] [ERROR] ❌ Error obteniendo Challengers: 401 Client Error: Unauthorized for url: https://euw1.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5
+[2025-11-06 21:19:32] [ERROR] ❌ No se pudo cargar la lista de Challengers
+[2025-11-06 21:20:33] [INFO] ======================================================================
+[2025-11-06 21:20:33] [INFO] 🚀 MONITOR EN TIEMPO REAL - DESCARGA DE REPLAYS
+[2025-11-06 21:20:33] [INFO] ======================================================================
+[2025-11-06 21:20:33] [INFO] 
+[1/3] Conectando al cliente de LoL...
+[2025-11-06 21:20:33] [INFO] ✅ Conectado al cliente como: 
+[2025-11-06 21:20:33] [INFO] 
+[2/3] Cargando lista de Challengers...
+[2025-11-06 21:20:33] [INFO] Actualizando lista de Challengers...
+[2025-11-06 21:20:33] [ERROR] ❌ Error obteniendo Challengers: 401 Client Error: Unauthorized for url: https://euw1.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5
+[2025-11-06 21:20:33] [ERROR] ❌ No se pudo cargar la lista de Challengers
+[2025-11-06 21:20:37] [INFO] ======================================================================
+[2025-11-06 21:20:37] [INFO] 🚀 MONITOR EN TIEMPO REAL - DESCARGA DE REPLAYS
+[2025-11-06 21:20:37] [INFO] ======================================================================
+[2025-11-06 21:20:37] [INFO] 
+[1/3] Conectando al cliente de LoL...
+[2025-11-06 21:20:38] [INFO] ✅ Conectado al cliente como: 
+[2025-11-06 21:20:38] [INFO] 
+[2/3] Cargando lista de Challengers...
+[2025-11-06 21:20:38] [INFO] Actualizando lista de Challengers...
+[2025-11-06 21:20:38] [ERROR] ❌ Error obteniendo Challengers: 401 Client Error: Unauthorized for url: https://euw1.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5
+[2025-11-06 21:20:38] [ERROR] ❌ No se pudo cargar la lista de Challengers
+[2025-11-06 21:20:40] [INFO] ======================================================================
+[2025-11-06 21:20:40] [INFO] 🚀 MONITOR EN TIEMPO REAL - DESCARGA DE REPLAYS
+[2025-11-06 21:20:40] [INFO] ======================================================================
+[2025-11-06 21:20:40] [INFO] 
+[1/3] Conectando al cliente de LoL...
+[2025-11-06 21:20:41] [INFO] ✅ Conectado al cliente como: 
+[2025-11-06 21:20:41] [INFO] 
+[2/3] Cargando lista de Challengers...
+[2025-11-06 21:20:41] [INFO] Actualizando lista de Challengers...
+[2025-11-06 21:20:41] [ERROR] ❌ Error obteniendo Challengers: 401 Client Error: Unauthorized for url: https://euw1.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5
+[2025-11-06 21:20:41] [ERROR] ❌ No se pudo cargar la lista de Challengers
+[2025-11-06 21:20:46] [INFO] ======================================================================
+[2025-11-06 21:20:46] [INFO] 🚀 MONITOR EN TIEMPO REAL - DESCARGA DE REPLAYS
+[2025-11-06 21:20:46] [INFO] ======================================================================
+[2025-11-06 21:20:46] [INFO] 
+[1/3] Conectando al cliente de LoL...
+[2025-11-06 21:20:46] [INFO] ✅ Conectado al cliente como: 
+[2025-11-06 21:20:46] [INFO] 
+[2/3] Cargando lista de Challengers...
+[2025-11-06 21:20:46] [INFO] Actualizando lista de Challengers...
+[2025-11-06 21:20:53] [WARN] ⚠️ Error 401 obteniendo Riot ID para AX48zCwxL9csCv9H0qy-BHHNCP-KhxNF7zuxWma5QwaDMH3Lsx3VDyIgkp7COkj155Okln9Nx1Ngsg
+[2025-11-06 21:20:56] [INFO]   Procesados 10/50...
+[2025-11-06 21:21:06] [INFO]   Procesados 20/50...
+[2025-11-06 21:21:16] [INFO]   Procesados 30/50...
+[2025-11-06 21:21:27] [INFO]   Procesados 40/50...
+[2025-11-06 21:21:37] [INFO]   Procesados 50/50...
+[2025-11-06 21:21:38] [INFO] ✅ 50 Challengers cargados con nombres
+[2025-11-06 21:21:38] [INFO] 
+Top 5 Challengers monitoreados:
+[2025-11-06 21:21:38] [INFO]   1. TwTv LadicusVibe#Vayne (1970 LP)
+[2025-11-06 21:21:38] [INFO]   2. The Face Farter#EUW (1944 LP)
+[2025-11-06 21:21:38] [INFO]   3. Kenal#EUW (1868 LP)
+[2025-11-06 21:21:38] [INFO]   4. Nano#IRE (1863 LP)
+[2025-11-06 21:21:38] [INFO]   5. Mαster Oogwαy#EUW (1832 LP)
+[2025-11-06 21:21:38] [INFO] 
+[3/3] Iniciando monitoreo continuo (cada 180s)
+[2025-11-06 21:21:38] [INFO] ======================================================================
+[2025-11-06 21:21:38] [INFO] Presiona Ctrl+C para detener
+
+[2025-11-06 21:21:38] [INFO] 
+>>> CICLO #1 <<<
+[2025-11-06 21:21:38] [INFO] 
+======================================================================
+[2025-11-06 21:21:38] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 21:21:38] [INFO] ======================================================================
+[2025-11-06 21:21:38] [INFO] 🆕 Nueva partida detectada: 7594489532 (TwTv LadicusVibe#Vayne) - En curso hace 14 min
+[2025-11-06 21:21:38] [INFO] 🎮 Monitoreando partida: 7594489532 (TwTv LadicusVibe#Vayne)
+[2025-11-06 21:21:39] [INFO] 🆕 Nueva partida detectada: 7594498724 (The Face Farter#EUW) - En curso hace 4 min
+[2025-11-06 21:21:39] [INFO] 🎮 Monitoreando partida: 7594498724 (The Face Farter#EUW)
+[2025-11-06 21:22:08] [INFO] 🆕 Nueva partida detectada: 7594483062 ( Nothing much#EUW) - En curso hace 13 min
+[2025-11-06 21:22:08] [INFO] 🎮 Monitoreando partida: 7594483062 ( Nothing much#EUW)
+[2025-11-06 21:22:15] [INFO] ✅ Ciclo completado. En partida ahora: 6
+[2025-11-06 21:22:15] [INFO]    Nuevas partidas monitoreadas: 3
+[2025-11-06 21:22:15] [INFO]    Partidas activas monitoreando: 3
+[2025-11-06 21:22:15] [INFO]    Replays descargados (total): 0
+[2025-11-06 21:22:15] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-06 21:24:40] [INFO] ✅ Partida terminada: 7594489532 (duró ~3 min)
+[2025-11-06 21:24:40] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-06 21:25:15] [INFO] 
+>>> CICLO #2 <<<
+[2025-11-06 21:25:15] [INFO] 
+======================================================================
+[2025-11-06 21:25:15] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-06 21:25:15] [INFO] ======================================================================
+[2025-11-06 21:25:27] [INFO] 
+⚠️  Deteniendo monitor...
+[2025-11-06 21:25:27] [INFO] Total de replays descargados: 0
+[2025-11-06 21:25:27] [INFO] ✅ Monitor detenido correctamente
+[2025-11-14 10:14:25] [INFO] ======================================================================
+[2025-11-14 10:14:25] [INFO] 🚀 MONITOR EN TIEMPO REAL - DESCARGA DE REPLAYS
+[2025-11-14 10:14:25] [INFO] ======================================================================
+[2025-11-14 10:14:25] [INFO] 
+[1/3] Conectando al cliente de LoL...
+[2025-11-14 10:14:27] [ERROR] ❌ Cliente de LoL no encontrado. Abre el cliente y reinicia.
+[2025-11-14 10:17:11] [INFO] ======================================================================
+[2025-11-14 10:17:11] [INFO] 🚀 MONITOR EN TIEMPO REAL - DESCARGA DE REPLAYS
+[2025-11-14 10:17:11] [INFO] ======================================================================
+[2025-11-14 10:17:11] [INFO] 
+[1/3] Conectando al cliente de LoL...
+[2025-11-14 10:17:12] [INFO] ✅ Conectado al cliente como: 
+[2025-11-14 10:17:12] [INFO] 
+[2/3] Cargando lista de Challengers...
+[2025-11-14 10:17:12] [INFO] Actualizando lista de Challengers...
+[2025-11-14 10:17:20] [INFO]   Procesados 10/50...
+[2025-11-14 10:17:30] [INFO]   Procesados 20/50...
+[2025-11-14 10:17:39] [INFO]   Procesados 30/50...
+[2025-11-14 10:17:48] [INFO]   Procesados 40/50...
+[2025-11-14 10:17:57] [INFO]   Procesados 50/50...
+[2025-11-14 10:17:58] [INFO] ✅ 50 Challengers cargados con nombres
+[2025-11-14 10:17:58] [INFO] 
+Top 5 Challengers monitoreados:
+[2025-11-14 10:17:58] [INFO]   1. Kenal#EUW (2070 LP)
+[2025-11-14 10:17:58] [INFO]   2. The Face Farter#EUW (2045 LP)
+[2025-11-14 10:17:58] [INFO]   3. TwTv LadicusVibe#Vayne (1897 LP)
+[2025-11-14 10:17:58] [INFO]   4. Maynter#EUW (1796 LP)
+[2025-11-14 10:17:58] [INFO]   5. Perly khder#SIL (1785 LP)
+[2025-11-14 10:17:58] [INFO] 
+[3/3] Iniciando monitoreo continuo (cada 180s)
+[2025-11-14 10:17:58] [INFO] ======================================================================
+[2025-11-14 10:17:58] [INFO] Presiona Ctrl+C para detener
+
+[2025-11-14 10:17:58] [INFO] 
+>>> CICLO #1 <<<
+[2025-11-14 10:17:58] [INFO] 
+======================================================================
+[2025-11-14 10:17:58] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:17:58] [INFO] ======================================================================
+[2025-11-14 10:18:20] [INFO] 🆕 Nueva partida detectada: 7603078535 (twtv shiftlol5#2005) - En curso hace 22 min
+[2025-11-14 10:18:20] [INFO] 🎮 Monitoreando partida: 7603078535 (twtv shiftlol5#2005)
+[2025-11-14 10:18:28] [INFO] ✅ Ciclo completado. En partida ahora: 1
+[2025-11-14 10:18:28] [INFO]    Nuevas partidas monitoreadas: 1
+[2025-11-14 10:18:28] [INFO]    Partidas activas monitoreando: 1
+[2025-11-14 10:18:28] [INFO]    Replays descargados (total): 0
+[2025-11-14 10:18:28] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 10:21:28] [INFO] 
+>>> CICLO #2 <<<
+[2025-11-14 10:21:28] [INFO] 
+======================================================================
+[2025-11-14 10:21:28] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:21:28] [INFO] ======================================================================
+[2025-11-14 10:21:50] [INFO] 🆕 Nueva partida detectada: 7603082636 (ismααα#EUW) - En curso hace 1 min
+[2025-11-14 10:21:50] [INFO] 🎮 Monitoreando partida: 7603082636 (ismααα#EUW)
+[2025-11-14 10:22:00] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-14 10:22:00] [INFO]    Nuevas partidas monitoreadas: 1
+[2025-11-14 10:22:00] [INFO]    Partidas activas monitoreando: 2
+[2025-11-14 10:22:00] [INFO]    Replays descargados (total): 0
+[2025-11-14 10:22:00] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 10:25:00] [INFO] 
+>>> CICLO #3 <<<
+[2025-11-14 10:25:00] [INFO] 
+======================================================================
+[2025-11-14 10:25:00] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:25:00] [INFO] ======================================================================
+[2025-11-14 10:25:05] [INFO] 🆕 Nueva partida detectada: 7603081881 (Nano#IRE) - En curso hace 0 min
+[2025-11-14 10:25:05] [INFO] 🎮 Monitoreando partida: 7603081881 (Nano#IRE)
+[2025-11-14 10:25:22] [INFO] ✅ Partida terminada: 7603078535 (duró ~7 min)
+[2025-11-14 10:25:22] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-14 10:25:30] [INFO] ✅ Ciclo completado. En partida ahora: 3
+[2025-11-14 10:25:30] [INFO]    Nuevas partidas monitoreadas: 1
+[2025-11-14 10:25:30] [INFO]    Partidas activas monitoreando: 3
+[2025-11-14 10:25:30] [INFO]    Replays descargados (total): 0
+[2025-11-14 10:25:30] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 10:28:25] [ERROR] ❌ Excepción descargando 7603078535: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603078535/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883DC830>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:28:25] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-14 10:28:30] [INFO] 
+>>> CICLO #4 <<<
+[2025-11-14 10:28:30] [INFO] 
+======================================================================
+[2025-11-14 10:28:30] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:28:30] [INFO] ======================================================================
+[2025-11-14 10:29:01] [INFO] ✅ Ciclo completado. En partida ahora: 3
+[2025-11-14 10:29:01] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-14 10:29:01] [INFO]    Partidas activas monitoreando: 3
+[2025-11-14 10:29:01] [INFO]    Replays descargados (total): 0
+[2025-11-14 10:29:01] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 10:29:57] [ERROR] ❌ Excepción descargando 7603078535: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603078535/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F78824B250>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:29:57] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-14 10:31:29] [ERROR] ❌ Excepción descargando 7603078535: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603078535/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F78824BB10>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:31:29] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-14 10:32:01] [INFO] 
+>>> CICLO #5 <<<
+[2025-11-14 10:32:01] [INFO] 
+======================================================================
+[2025-11-14 10:32:01] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:32:01] [INFO] ======================================================================
+[2025-11-14 10:32:32] [INFO] ✅ Ciclo completado. En partida ahora: 3
+[2025-11-14 10:32:32] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-14 10:32:32] [INFO]    Partidas activas monitoreando: 3
+[2025-11-14 10:32:32] [INFO]    Replays descargados (total): 0
+[2025-11-14 10:32:32] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 10:33:01] [ERROR] ❌ Excepción descargando 7603078535: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603078535/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CAFD0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:33:01] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-14 10:34:33] [ERROR] ❌ Excepción descargando 7603078535: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603078535/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CB110>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:34:33] [ERROR] ❌ No se pudo descargar 7603078535 después de 5 intentos
+[2025-11-14 10:34:33] [ERROR]    Posibles razones:
+[2025-11-14 10:34:33] [ERROR]    - Partida de patch antiguo
+[2025-11-14 10:34:33] [ERROR]    - Riot no guardó el replay
+[2025-11-14 10:34:33] [ERROR]    - Replay expiró (>48h)
+[2025-11-14 10:36:24] [INFO] 
+>>> CICLO #6 <<<
+[2025-11-14 10:36:24] [INFO] 
+======================================================================
+[2025-11-14 10:36:24] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:36:24] [INFO] ======================================================================
+[2025-11-14 10:36:56] [INFO] ✅ Ciclo completado. En partida ahora: 2
+[2025-11-14 10:36:56] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-14 10:36:56] [INFO]    Partidas activas monitoreando: 2
+[2025-11-14 10:36:56] [INFO]    Replays descargados (total): 0
+[2025-11-14 10:36:56] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 10:39:56] [INFO] 
+>>> CICLO #7 <<<
+[2025-11-14 10:39:56] [INFO] 
+======================================================================
+[2025-11-14 10:39:56] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:39:56] [INFO] ======================================================================
+[2025-11-14 10:40:00] [INFO] 🆕 Nueva partida detectada: 7603088264 (ANDA#RIEL) - En curso hace 0 min
+[2025-11-14 10:40:00] [INFO] 🎮 Monitoreando partida: 7603088264 (ANDA#RIEL)
+[2025-11-14 10:40:26] [INFO] ✅ Partida terminada: 7603082636 (duró ~18 min)
+[2025-11-14 10:40:26] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-14 10:40:27] [INFO] ✅ Ciclo completado. En partida ahora: 5
+[2025-11-14 10:40:27] [INFO]    Nuevas partidas monitoreadas: 1
+[2025-11-14 10:40:27] [INFO]    Partidas activas monitoreando: 3
+[2025-11-14 10:40:27] [INFO]    Replays descargados (total): 0
+[2025-11-14 10:40:27] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 10:42:13] [INFO] ======================================================================
+[2025-11-14 10:42:13] [INFO] 🚀 MONITOR EN TIEMPO REAL - CAPTURA DE REPLAYS (MÉTODO POROFESSOR)
+[2025-11-14 10:42:13] [INFO] ======================================================================
+[2025-11-14 10:42:13] [INFO] ⚠️ IMPORTANTE: Solo se capturan partidas en sus primeros 3 minutos
+[2025-11-14 10:42:13] [INFO] 
+[1/2] Cargando lista de Challengers...
+[2025-11-14 10:42:13] [INFO] Actualizando lista de Challengers...
+[2025-11-14 10:42:22] [INFO]   Procesados 10/50...
+[2025-11-14 10:42:32] [INFO]   Procesados 20/50...
+[2025-11-14 10:42:41] [INFO]   Procesados 30/50...
+[2025-11-14 10:42:50] [INFO]   Procesados 40/50...
+[2025-11-14 10:42:59] [INFO]   Procesados 50/50...
+[2025-11-14 10:43:00] [INFO] ✅ 50 Challengers cargados
+[2025-11-14 10:43:00] [INFO] 
+Top 5 Challengers monitoreados:
+[2025-11-14 10:43:00] [INFO]   1. Kenal#EUW (2070 LP)
+[2025-11-14 10:43:00] [INFO]   2. The Face Farter#EUW (2045 LP)
+[2025-11-14 10:43:00] [INFO]   3. TwTv LadicusVibe#Vayne (1897 LP)
+[2025-11-14 10:43:00] [INFO]   4. Maynter#EUW (1796 LP)
+[2025-11-14 10:43:00] [INFO]   5. Perly khder#SIL (1785 LP)
+[2025-11-14 10:43:00] [INFO] 
+[2/2] Iniciando monitoreo continuo (cada 120s)
+[2025-11-14 10:43:00] [INFO] ======================================================================
+[2025-11-14 10:43:00] [INFO] Presiona Ctrl+C para detener
+
+[2025-11-14 10:43:00] [INFO] 
+>>> CICLO #1 <<<
+[2025-11-14 10:43:00] [INFO] 
+======================================================================
+[2025-11-14 10:43:00] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:43:00] [INFO] ======================================================================
+[2025-11-14 10:43:06] [INFO]   ⏭️ Saltando 7603088264 (ANDA#RIEL) - Ya pasó ventana de captura (min 3.8)
+[2025-11-14 10:43:12] [INFO]   ⏭️ Saltando 7603088264 (Kozi#Z10) - Ya pasó ventana de captura (min 3.9)
+[2025-11-14 10:43:21] [INFO]   ⏭️ Saltando 7603088264 (ALBANIAN#iLevi) - Ya pasó ventana de captura (min 4.0)
+[2025-11-14 10:43:27] [INFO] 
+>>> CICLO #8 <<<
+[2025-11-14 10:43:27] [INFO] 
+======================================================================
+[2025-11-14 10:43:27] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:43:27] [INFO] ======================================================================
+[2025-11-14 10:43:28] [ERROR] ❌ Excepción descargando 7603082636: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603082636/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CB610>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:43:28] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-14 10:43:31] [INFO] ✅ Ciclo completado. En partida ahora: 4
+[2025-11-14 10:43:31] [INFO]    Nuevas capturas iniciadas: 0
+[2025-11-14 10:43:31] [INFO]    Capturas activas: 0
+[2025-11-14 10:43:31] [INFO]    Replays capturados (total): 0
+[2025-11-14 10:43:31] [INFO] 
+⏸️ Esperando 120 segundos...
+[2025-11-14 10:43:57] [INFO] ✅ Ciclo completado. En partida ahora: 4
+[2025-11-14 10:43:57] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-14 10:43:57] [INFO]    Partidas activas monitoreando: 3
+[2025-11-14 10:43:57] [INFO]    Replays descargados (total): 0
+[2025-11-14 10:43:57] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 10:44:01] [INFO] ✅ Partida terminada: 7603088264 (duró ~4 min)
+[2025-11-14 10:44:01] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-14 10:45:00] [ERROR] ❌ Excepción descargando 7603082636: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603082636/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CB390>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:45:00] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-14 10:45:31] [INFO] 
+>>> CICLO #2 <<<
+[2025-11-14 10:45:31] [INFO] 
+======================================================================
+[2025-11-14 10:45:31] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:45:31] [INFO] ======================================================================
+[2025-11-14 10:45:36] [INFO]   ⏭️ Saltando 7603088264 (ANDA#RIEL) - Ya pasó ventana de captura (min 6.3)
+[2025-11-14 10:45:43] [INFO]   ⏭️ Saltando 7603088264 (Kozi#Z10) - Ya pasó ventana de captura (min 6.4)
+[2025-11-14 10:45:52] [INFO]   ⏭️ Saltando 7603088264 (ALBANIAN#iLevi) - Ya pasó ventana de captura (min 6.5)
+[2025-11-14 10:46:01] [INFO] ✅ Ciclo completado. En partida ahora: 4
+[2025-11-14 10:46:01] [INFO]    Nuevas capturas iniciadas: 0
+[2025-11-14 10:46:01] [INFO]    Capturas activas: 0
+[2025-11-14 10:46:01] [INFO]    Replays capturados (total): 0
+[2025-11-14 10:46:01] [INFO] 
+⏸️ Esperando 120 segundos...
+[2025-11-14 10:46:32] [ERROR] ❌ Excepción descargando 7603082636: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603082636/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CAAD0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:46:32] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-14 10:46:58] [INFO] 
+>>> CICLO #9 <<<
+[2025-11-14 10:46:58] [INFO] 
+======================================================================
+[2025-11-14 10:46:58] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:46:58] [INFO] ======================================================================
+[2025-11-14 10:47:03] [ERROR] ❌ Excepción descargando 7603088264: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603088264/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CAE90>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:47:03] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-14 10:47:20] [INFO] 🆕 Nueva partida detectada: 7603091845 (ismααα#EUW) - En curso hace 1 min
+[2025-11-14 10:47:20] [INFO] 🎮 Monitoreando partida: 7603091845 (ismααα#EUW)
+[2025-11-14 10:47:27] [INFO] ✅ Partida terminada: 7603081881 (duró ~22 min)
+[2025-11-14 10:47:27] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-14 10:47:28] [INFO] ✅ Ciclo completado. En partida ahora: 4
+[2025-11-14 10:47:28] [INFO]    Nuevas partidas monitoreadas: 1
+[2025-11-14 10:47:28] [INFO]    Partidas activas monitoreando: 4
+[2025-11-14 10:47:28] [INFO]    Replays descargados (total): 0
+[2025-11-14 10:47:28] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 10:48:01] [INFO] 
+>>> CICLO #3 <<<
+[2025-11-14 10:48:01] [INFO] 
+======================================================================
+[2025-11-14 10:48:01] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:48:01] [INFO] ======================================================================
+[2025-11-14 10:48:04] [ERROR] ❌ Excepción descargando 7603082636: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603082636/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CA490>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:48:04] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-14 10:48:07] [INFO]   ⏭️ Saltando 7603088264 (ANDA#RIEL) - Ya pasó ventana de captura (min 8.8)
+[2025-11-14 10:48:14] [INFO]   ⏭️ Saltando 7603088264 (Kozi#Z10) - Ya pasó ventana de captura (min 8.9)
+[2025-11-14 10:48:22] [INFO]   ⏭️ Saltando 7603088264 (ALBANIAN#iLevi) - Ya pasó ventana de captura (min 9.0)
+[2025-11-14 10:48:24] [INFO] 🆕 Nueva partida detectada: 7603091845 (ismααα#EUW) - Min 2.2
+[2025-11-14 10:48:24] [INFO] ⏱️ Intentando capturar 7603091845 en min 2.2 (ismααα#EUW)
+[2025-11-14 10:48:24] [INFO] 🎬 Iniciando captura en vivo: 7603091845 (ismααα#EUW)
+[2025-11-14 10:48:24] [WARN] ⚠️ No se pudo obtener metadata para 7603091845
+[2025-11-14 10:48:24] [ERROR] ❌ No hay chunks disponibles para 7603091845
+[2025-11-14 10:48:24] [ERROR] ❌ No se pudo capturar 7603091845
+[2025-11-14 10:48:32] [INFO] ✅ Ciclo completado. En partida ahora: 4
+[2025-11-14 10:48:32] [INFO]    Nuevas capturas iniciadas: 1
+[2025-11-14 10:48:32] [INFO]    Capturas activas: 0
+[2025-11-14 10:48:32] [INFO]    Replays capturados (total): 0
+[2025-11-14 10:48:32] [INFO] 
+⏸️ Esperando 120 segundos...
+[2025-11-14 10:48:35] [ERROR] ❌ Excepción descargando 7603088264: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603088264/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C96D0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:48:35] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-14 10:49:36] [ERROR] ❌ Excepción descargando 7603082636: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603082636/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C9450>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:49:36] [ERROR] ❌ No se pudo descargar 7603082636 después de 5 intentos
+[2025-11-14 10:49:36] [ERROR]    Posibles razones:
+[2025-11-14 10:49:36] [ERROR]    - Partida de patch antiguo
+[2025-11-14 10:49:36] [ERROR]    - Riot no guardó el replay
+[2025-11-14 10:49:36] [ERROR]    - Replay expiró (>48h)
+[2025-11-14 10:50:07] [ERROR] ❌ Excepción descargando 7603088264: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603088264/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C91D0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:50:07] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-14 10:50:28] [INFO] 
+>>> CICLO #10 <<<
+[2025-11-14 10:50:28] [INFO] 
+======================================================================
+[2025-11-14 10:50:28] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:50:28] [INFO] ======================================================================
+[2025-11-14 10:50:30] [ERROR] ❌ Excepción descargando 7603081881: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603081881/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C8F50>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:50:30] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-14 10:50:32] [INFO] 
+>>> CICLO #4 <<<
+[2025-11-14 10:50:32] [INFO] 
+======================================================================
+[2025-11-14 10:50:32] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:50:32] [INFO] ======================================================================
+[2025-11-14 10:50:54] [INFO]   ⏭️ Saltando 7603091845 (ismααα#EUW) - Ya pasó ventana de captura (min 4.7)
+[2025-11-14 10:50:59] [INFO] ✅ Ciclo completado. En partida ahora: 4
+[2025-11-14 10:50:59] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-14 10:50:59] [INFO]    Partidas activas monitoreando: 3
+[2025-11-14 10:50:59] [INFO]    Replays descargados (total): 0
+[2025-11-14 10:50:59] [INFO] 
+🔄 Actualizando lista de Challengers...
+[2025-11-14 10:50:59] [INFO] Actualizando lista de Challengers...
+[2025-11-14 10:51:03] [INFO] ✅ Ciclo completado. En partida ahora: 4
+[2025-11-14 10:51:03] [INFO]    Nuevas capturas iniciadas: 0
+[2025-11-14 10:51:03] [INFO]    Capturas activas: 0
+[2025-11-14 10:51:03] [INFO]    Replays capturados (total): 0
+[2025-11-14 10:51:03] [INFO] 
+⏸️ Esperando 120 segundos...
+[2025-11-14 10:51:08] [INFO]   Procesados 10/50...
+[2025-11-14 10:51:17] [INFO]   Procesados 20/50...
+[2025-11-14 10:51:20] [INFO] ✅ Partida terminada: 7603091845 (duró ~4 min)
+[2025-11-14 10:51:20] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-14 10:51:26] [INFO]   Procesados 30/50...
+[2025-11-14 10:51:35] [INFO]   Procesados 40/50...
+[2025-11-14 10:51:39] [ERROR] ❌ Excepción descargando 7603088264: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603088264/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C8B90>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:51:39] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-14 10:51:44] [INFO]   Procesados 50/50...
+[2025-11-14 10:51:45] [INFO] ✅ 50 Challengers cargados con nombres
+[2025-11-14 10:51:45] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 10:51:49] [INFO] 
+⚠️ Deteniendo monitor...
+[2025-11-14 10:51:49] [INFO] Total de replays capturados: 0
+[2025-11-14 10:51:49] [INFO] ✅ Monitor detenido correctamente
+[2025-11-14 10:51:52] [INFO] ======================================================================
+[2025-11-14 10:51:52] [INFO] 🚀 MONITOR DE REPLAYS - API DE ESPECTADOR
+[2025-11-14 10:51:52] [INFO] ======================================================================
+[2025-11-14 10:51:52] [INFO] Región: EUW1
+[2025-11-14 10:51:52] [INFO] Servidor espectador: http://spectator.euw1.lol.riotgames.com:80
+[2025-11-14 10:51:52] [INFO] ⚠️ Solo captura partidas en sus primeros 3 minutos
+
+[2025-11-14 10:51:52] [INFO] [1/2] Cargando Challengers...
+[2025-11-14 10:51:52] [INFO] Actualizando lista de Challengers...
+[2025-11-14 10:51:52] [ERROR] ❌ Error obteniendo Challengers: 429 Client Error: Too Many Requests for url: https://euw1.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5
+[2025-11-14 10:51:52] [ERROR] ❌ No se pudo cargar Challengers
+[2025-11-14 10:52:02] [ERROR] ❌ Excepción descargando 7603081881: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603081881/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C8CD0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:52:02] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-14 10:52:02] [INFO] ======================================================================
+[2025-11-14 10:52:02] [INFO] 🚀 MONITOR DE REPLAYS - API DE ESPECTADOR
+[2025-11-14 10:52:02] [INFO] ======================================================================
+[2025-11-14 10:52:02] [INFO] Región: EUW1
+[2025-11-14 10:52:02] [INFO] Servidor espectador: http://spectator.euw1.lol.riotgames.com:80
+[2025-11-14 10:52:02] [INFO] ⚠️ Solo captura partidas en sus primeros 3 minutos
+
+[2025-11-14 10:52:02] [INFO] [1/2] Cargando Challengers...
+[2025-11-14 10:52:02] [INFO] Actualizando lista de Challengers...
+[2025-11-14 10:52:02] [ERROR] ❌ Error obteniendo Challengers: 429 Client Error: Too Many Requests for url: https://euw1.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5
+[2025-11-14 10:52:02] [ERROR] ❌ No se pudo cargar Challengers
+[2025-11-14 10:53:11] [ERROR] ❌ Excepción descargando 7603088264: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603088264/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C87D0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:53:11] [ERROR] ❌ No se pudo descargar 7603088264 después de 5 intentos
+[2025-11-14 10:53:11] [ERROR]    Posibles razones:
+[2025-11-14 10:53:11] [ERROR]    - Partida de patch antiguo
+[2025-11-14 10:53:11] [ERROR]    - Riot no guardó el replay
+[2025-11-14 10:53:11] [ERROR]    - Replay expiró (>48h)
+[2025-11-14 10:53:34] [ERROR] ❌ Excepción descargando 7603081881: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603081881/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C8550>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:53:34] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-14 10:54:22] [ERROR] ❌ Excepción descargando 7603091845: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603091845/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C82D0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:54:22] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-14 10:54:45] [INFO] 
+>>> CICLO #11 <<<
+[2025-11-14 10:54:45] [INFO] 
+======================================================================
+[2025-11-14 10:54:45] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:54:45] [INFO] ======================================================================
+[2025-11-14 10:54:51] [INFO] 🆕 Nueva partida detectada: 7603088264 (ANDA#RIEL) - En curso hace 15 min
+[2025-11-14 10:54:51] [INFO] 🎮 Monitoreando partida: 7603088264 (ANDA#RIEL)
+[2025-11-14 10:55:06] [ERROR] ❌ Excepción descargando 7603081881: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603081881/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C8050>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:55:06] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-14 10:55:16] [INFO] ✅ Ciclo completado. En partida ahora: 4
+[2025-11-14 10:55:16] [INFO]    Nuevas partidas monitoreadas: 1
+[2025-11-14 10:55:16] [INFO]    Partidas activas monitoreando: 3
+[2025-11-14 10:55:16] [INFO]    Replays descargados (total): 0
+[2025-11-14 10:55:16] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 10:55:54] [ERROR] ❌ Excepción descargando 7603091845: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603091845/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CB9D0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:55:55] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-14 10:56:38] [ERROR] ❌ Excepción descargando 7603081881: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603081881/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CBC50>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:56:38] [ERROR] ❌ No se pudo descargar 7603081881 después de 5 intentos
+[2025-11-14 10:56:38] [ERROR]    Posibles razones:
+[2025-11-14 10:56:38] [ERROR]    - Partida de patch antiguo
+[2025-11-14 10:56:38] [ERROR]    - Riot no guardó el replay
+[2025-11-14 10:56:38] [ERROR]    - Replay expiró (>48h)
+[2025-11-14 10:57:27] [ERROR] ❌ Excepción descargando 7603091845: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603091845/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CBED0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:57:27] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-14 10:58:16] [INFO] 
+>>> CICLO #12 <<<
+[2025-11-14 10:58:16] [INFO] 
+======================================================================
+[2025-11-14 10:58:16] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 10:58:16] [INFO] ======================================================================
+[2025-11-14 10:58:19] [INFO] 🆕 Nueva partida detectada: 7603094142 (Nano#IRE) - En curso hace 2 min
+[2025-11-14 10:58:19] [INFO] 🎮 Monitoreando partida: 7603094142 (Nano#IRE)
+[2025-11-14 10:58:47] [INFO] ✅ Ciclo completado. En partida ahora: 5
+[2025-11-14 10:58:47] [INFO]    Nuevas partidas monitoreadas: 1
+[2025-11-14 10:58:47] [INFO]    Partidas activas monitoreando: 3
+[2025-11-14 10:58:47] [INFO]    Replays descargados (total): 0
+[2025-11-14 10:58:47] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 10:58:59] [ERROR] ❌ Excepción descargando 7603091845: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603091845/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F788FA0190>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 10:58:59] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-14 11:00:31] [ERROR] ❌ Excepción descargando 7603091845: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603091845/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CBED0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-14 11:00:31] [ERROR] ❌ No se pudo descargar 7603091845 después de 5 intentos
+[2025-11-14 11:00:31] [ERROR]    Posibles razones:
+[2025-11-14 11:00:31] [ERROR]    - Partida de patch antiguo
+[2025-11-14 11:00:31] [ERROR]    - Riot no guardó el replay
+[2025-11-14 11:00:31] [ERROR]    - Replay expiró (>48h)
+[2025-11-14 11:01:47] [INFO] 
+>>> CICLO #13 <<<
+[2025-11-14 11:01:47] [INFO] 
+======================================================================
+[2025-11-14 11:01:47] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 11:01:47] [INFO] ======================================================================
+[2025-11-14 11:02:28] [INFO] ✅ Ciclo completado. En partida ahora: 4
+[2025-11-14 11:02:28] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-14 11:02:28] [INFO]    Partidas activas monitoreando: 2
+[2025-11-14 11:02:28] [INFO]    Replays descargados (total): 0
+[2025-11-14 11:02:28] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 11:05:28] [INFO] 
+>>> CICLO #14 <<<
+[2025-11-14 11:05:28] [INFO] 
+======================================================================
+[2025-11-14 11:05:28] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 11:05:28] [INFO] ======================================================================
+[2025-11-14 11:06:12] [INFO] ✅ Ciclo completado. En partida ahora: 4
+[2025-11-14 11:06:12] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-14 11:06:12] [INFO]    Partidas activas monitoreando: 2
+[2025-11-14 11:06:12] [INFO]    Replays descargados (total): 0
+[2025-11-14 11:06:12] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 11:09:12] [INFO] 
+>>> CICLO #15 <<<
+[2025-11-14 11:09:12] [INFO] 
+======================================================================
+[2025-11-14 11:09:12] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 11:09:12] [INFO] ======================================================================
+[2025-11-14 11:09:26] [INFO] 🆕 Nueva partida detectada: 7603105636 (JEZUUU#0814) - En curso hace 1 min
+[2025-11-14 11:09:26] [INFO] 🎮 Monitoreando partida: 7603105636 (JEZUUU#0814)
+[2025-11-14 11:09:43] [INFO] ✅ Ciclo completado. En partida ahora: 6
+[2025-11-14 11:09:43] [INFO]    Nuevas partidas monitoreadas: 1
+[2025-11-14 11:09:43] [INFO]    Partidas activas monitoreando: 3
+[2025-11-14 11:09:43] [INFO]    Replays descargados (total): 0
+[2025-11-14 11:09:43] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-14 11:48:03] [INFO] 
+>>> CICLO #16 <<<
+[2025-11-14 11:48:03] [INFO] ✅ Partida terminada: 7603088264 (duró ~53 min)
+[2025-11-14 11:48:03] [INFO] ✅ Partida terminada: 7603105636 (duró ~38 min)
+[2025-11-14 11:48:04] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-14 11:48:04] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-14 11:48:03] [INFO] ✅ Partida terminada: 7603094142 (duró ~49 min)
+[2025-11-14 11:48:03] [INFO] 
+======================================================================
+[2025-11-14 11:48:04] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-14 11:48:04] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-14 11:48:04] [INFO] ======================================================================
+[2025-11-14 11:48:08] [INFO] 🆕 Nueva partida detectada: 7603120234 (Nano#IRE) - En curso hace 3 min
+[2025-11-14 11:48:08] [INFO] 🎮 Monitoreando partida: 7603120234 (Nano#IRE)
+[2025-11-14 11:48:16] [INFO] 🆕 Nueva partida detectada: 7603111567 (Kozi#Z10) - En curso hace 26 min
+[2025-11-14 11:48:16] [INFO] 🎮 Monitoreando partida: 7603111567 (Kozi#Z10)
+[2025-11-14 11:48:17] [INFO] 🆕 Nueva partida detectada: 7603121105 (JEZUUU#0814) - En curso hace 2 min
+[2025-11-14 11:48:17] [INFO] 🎮 Monitoreando partida: 7603121105 (JEZUUU#0814)
+[2025-11-15 15:36:18] [INFO] ✅ Ciclo completado. En partida ahora: 3
+[2025-11-15 15:36:18] [INFO]    Nuevas partidas monitoreadas: 3
+[2025-11-15 15:36:18] [INFO]    Partidas activas monitoreando: 6
+[2025-11-15 15:36:18] [INFO]    Replays descargados (total): 0
+[2025-11-15 15:36:18] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-15 15:36:52] [INFO] ✅ Partida terminada: 7603120234 (duró ~1668 min)
+[2025-11-15 15:36:52] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-15 15:37:01] [INFO] ✅ Partida terminada: 7603111567 (duró ~1668 min)
+[2025-11-15 15:37:01] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-15 15:37:02] [INFO] ✅ Partida terminada: 7603121105 (duró ~1668 min)
+[2025-11-15 15:37:02] [INFO] ⏳ Esperando 3 min para que Riot procese el replay...
+[2025-11-15 15:38:53] [ERROR] ❌ Excepción descargando 7603088264: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603088264/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CBC50>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:38:53] [ERROR] ❌ Excepción descargando 7603105636: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603105636/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CBD90>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:38:53] [ERROR] ❌ Excepción descargando 7603094142: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603094142/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CBED0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:38:53] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-15 15:38:53] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-15 15:38:53] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-15 15:39:21] [INFO] 
+>>> CICLO #17 <<<
+[2025-11-15 15:39:21] [INFO] 
+======================================================================
+[2025-11-15 15:39:21] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-15 15:39:21] [INFO] ======================================================================
+[2025-11-15 15:39:52] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-15 15:39:52] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-15 15:39:52] [INFO]    Partidas activas monitoreando: 6
+[2025-11-15 15:39:52] [INFO]    Replays descargados (total): 0
+[2025-11-15 15:39:52] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-15 15:39:57] [ERROR] ❌ Excepción descargando 7603120234: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603120234/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F78824BED0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:39:57] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-15 15:40:06] [ERROR] ❌ Excepción descargando 7603111567: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603111567/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F78824BD90>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:40:06] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-15 15:40:07] [ERROR] ❌ Excepción descargando 7603121105: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603121105/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F788FB0050>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:40:07] [INFO] ⏳ Reintento 1/5 en 90s...
+[2025-11-15 15:40:25] [ERROR] ❌ Excepción descargando 7603105636: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603105636/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F788FB0410>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:40:25] [ERROR] ❌ Excepción descargando 7603088264: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603088264/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F788FB0690>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:40:25] [ERROR] ❌ Excepción descargando 7603094142: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603094142/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F788FB0550>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:40:25] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-15 15:40:25] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-15 15:40:25] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-15 15:41:29] [ERROR] ❌ Excepción descargando 7603120234: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603120234/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F788FB0B90>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:41:29] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-15 15:41:38] [ERROR] ❌ Excepción descargando 7603111567: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603111567/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F788FB0E10>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:41:38] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-15 15:41:39] [ERROR] ❌ Excepción descargando 7603121105: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603121105/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CBED0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:41:39] [INFO] ⏳ Reintento 2/5 en 90s...
+[2025-11-15 15:41:57] [ERROR] ❌ Excepción descargando 7603105636: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603105636/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CBB10>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:41:57] [ERROR] ❌ Excepción descargando 7603094142: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603094142/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CB9D0>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:41:57] [ERROR] ❌ Excepción descargando 7603088264: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603088264/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CB890>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:41:57] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-15 15:41:57] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-15 15:41:57] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-15 15:42:52] [INFO] 
+>>> CICLO #18 <<<
+[2025-11-15 15:42:52] [INFO] 
+======================================================================
+[2025-11-15 15:42:52] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-15 15:42:52] [INFO] ======================================================================
+[2025-11-15 15:43:01] [ERROR] ❌ Excepción descargando 7603120234: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603120234/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C8550>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:43:01] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-15 15:43:10] [ERROR] ❌ Excepción descargando 7603111567: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603111567/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C8410>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:43:10] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-15 15:43:11] [ERROR] ❌ Excepción descargando 7603121105: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603121105/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C8910>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:43:11] [INFO] ⏳ Reintento 3/5 en 90s...
+[2025-11-15 15:43:22] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-15 15:43:22] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-15 15:43:22] [INFO]    Partidas activas monitoreando: 6
+[2025-11-15 15:43:22] [INFO]    Replays descargados (total): 0
+[2025-11-15 15:43:22] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-15 15:43:29] [ERROR] ❌ Excepción descargando 7603094142: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603094142/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C8E10>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:43:29] [ERROR] ❌ Excepción descargando 7603105636: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603105636/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C8B90>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:43:29] [ERROR] ❌ Excepción descargando 7603088264: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603088264/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C8A50>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:43:29] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-15 15:43:29] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-15 15:43:29] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-15 15:44:33] [ERROR] ❌ Excepción descargando 7603120234: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603120234/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C9450>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:44:33] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-15 15:44:42] [ERROR] ❌ Excepción descargando 7603111567: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603111567/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C9310>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:44:42] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-15 15:44:44] [ERROR] ❌ Excepción descargando 7603121105: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603121105/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CA990>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:44:44] [INFO] ⏳ Reintento 4/5 en 90s...
+[2025-11-15 15:45:02] [ERROR] ❌ Excepción descargando 7603105636: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603105636/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CAE90>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:45:02] [ERROR] ❌ Excepción descargando 7603088264: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603088264/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883C9810>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:45:02] [ERROR] ❌ No se pudo descargar 7603105636 después de 5 intentos
+[2025-11-15 15:45:02] [ERROR] ❌ Excepción descargando 7603094142: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603094142/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CA350>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:45:02] [ERROR] ❌ No se pudo descargar 7603088264 después de 5 intentos
+[2025-11-15 15:45:02] [ERROR]    Posibles razones:
+[2025-11-15 15:45:02] [ERROR] ❌ No se pudo descargar 7603094142 después de 5 intentos
+[2025-11-15 15:45:02] [ERROR]    Posibles razones:
+[2025-11-15 15:45:02] [ERROR]    - Partida de patch antiguo
+[2025-11-15 15:45:02] [ERROR]    Posibles razones:
+[2025-11-15 15:45:02] [ERROR]    - Partida de patch antiguo
+[2025-11-15 15:45:02] [ERROR]    - Riot no guardó el replay
+[2025-11-15 15:45:02] [ERROR]    - Partida de patch antiguo
+[2025-11-15 15:45:02] [ERROR]    - Riot no guardó el replay
+[2025-11-15 15:45:02] [ERROR]    - Replay expiró (>48h)
+[2025-11-15 15:45:02] [ERROR]    - Replay expiró (>48h)
+ay
+[2025-11-15 15:45:02] [ERROR]    - Replay expiró (>48h)
+[2025-11-15 15:46:05] [ERROR] ❌ Excepción descargando 7603120234: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603120234/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CB610>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:46:05] [ERROR] ❌ No se pudo descargar 7603120234 después de 5 intentos
+[2025-11-15 15:46:05] [ERROR]    Posibles razones:
+[2025-11-15 15:46:05] [ERROR]    - Partida de patch antiguo
+[2025-11-15 15:46:05] [ERROR]    - Riot no guardó el replay
+[2025-11-15 15:46:05] [ERROR]    - Replay expiró (>48h)
+[2025-11-15 15:46:14] [ERROR] ❌ Excepción descargando 7603111567: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603111567/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CB750>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:46:14] [ERROR] ❌ No se pudo descargar 7603111567 después de 5 intentos
+[2025-11-15 15:46:14] [ERROR]    Posibles razones:
+[2025-11-15 15:46:14] [ERROR]    - Partida de patch antiguo
+[2025-11-15 15:46:14] [ERROR]    - Riot no guardó el replay
+[2025-11-15 15:46:14] [ERROR]    - Replay expiró (>48h)
+[2025-11-15 15:46:16] [ERROR] ❌ Excepción descargando 7603121105: HTTPSConnectionPool(host='127.0.0.1', port=52649): Max retries exceeded with url: /lol-replays/v1/rofls/7603121105/download (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x000001F7883CA850>: Failed to establish a new connection: [WinError 10061] No se puede establecer una conexión ya que el equipo de destino denegó expresamente dicha conexión'))
+[2025-11-15 15:46:16] [ERROR] ❌ No se pudo descargar 7603121105 después de 5 intentos
+[2025-11-15 15:46:16] [ERROR]    Posibles razones:
+[2025-11-15 15:46:16] [ERROR]    - Partida de patch antiguo
+[2025-11-15 15:46:16] [ERROR]    - Riot no guardó el replay
+[2025-11-15 15:46:16] [ERROR]    - Replay expiró (>48h)
+[2025-11-15 15:46:22] [INFO] 
+>>> CICLO #19 <<<
+[2025-11-15 15:46:22] [INFO] 
+======================================================================
+[2025-11-15 15:46:22] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-15 15:46:22] [INFO] ======================================================================
+[2025-11-15 15:46:52] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-15 15:46:52] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-15 15:46:52] [INFO]    Partidas activas monitoreando: 0
+[2025-11-15 15:46:52] [INFO]    Replays descargados (total): 0
+[2025-11-15 15:46:52] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-15 15:49:52] [INFO] 
+>>> CICLO #20 <<<
+[2025-11-15 15:49:52] [INFO] 
+======================================================================
+[2025-11-15 15:49:52] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-15 15:49:52] [INFO] ======================================================================
+[2025-11-15 15:50:22] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-15 15:50:22] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-15 15:50:22] [INFO]    Partidas activas monitoreando: 0
+[2025-11-15 15:50:22] [INFO]    Replays descargados (total): 0
+[2025-11-15 15:50:22] [INFO] 
+🔄 Actualizando lista de Challengers...
+[2025-11-15 15:50:22] [INFO] Actualizando lista de Challengers...
+[2025-11-15 15:50:22] [ERROR] ❌ Error obteniendo Challengers: 401 Client Error: Unauthorized for url: https://euw1.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5
+[2025-11-15 15:50:22] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-15 15:53:22] [INFO] 
+>>> CICLO #21 <<<
+[2025-11-15 15:53:22] [INFO] 
+======================================================================
+[2025-11-15 15:53:22] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-15 15:53:22] [INFO] ======================================================================
+[2025-11-15 15:53:52] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-15 15:53:52] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-15 15:53:52] [INFO]    Partidas activas monitoreando: 0
+[2025-11-15 15:53:52] [INFO]    Replays descargados (total): 0
+[2025-11-15 15:53:53] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-15 15:56:53] [INFO] 
+>>> CICLO #22 <<<
+[2025-11-15 15:56:53] [INFO] 
+======================================================================
+[2025-11-15 15:56:53] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-15 15:56:53] [INFO] ======================================================================
+[2025-11-15 15:57:23] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-15 15:57:23] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-15 15:57:23] [INFO]    Partidas activas monitoreando: 0
+[2025-11-15 15:57:23] [INFO]    Replays descargados (total): 0
+[2025-11-15 15:57:23] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-15 16:00:23] [INFO] 
+>>> CICLO #23 <<<
+[2025-11-15 16:00:23] [INFO] 
+======================================================================
+[2025-11-15 16:00:23] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-15 16:00:23] [INFO] ======================================================================
+[2025-11-15 16:00:53] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-15 16:00:53] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-15 16:00:53] [INFO]    Partidas activas monitoreando: 0
+[2025-11-15 16:00:53] [INFO]    Replays descargados (total): 0
+[2025-11-15 16:00:53] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-15 16:03:53] [INFO] 
+>>> CICLO #24 <<<
+[2025-11-15 16:03:53] [INFO] 
+======================================================================
+[2025-11-15 16:03:53] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-15 16:03:53] [INFO] ======================================================================
+[2025-11-15 16:04:23] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-15 16:04:23] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-15 16:04:23] [INFO]    Partidas activas monitoreando: 0
+[2025-11-15 16:04:23] [INFO]    Replays descargados (total): 0
+[2025-11-15 16:04:23] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-15 16:07:23] [INFO] 
+>>> CICLO #25 <<<
+[2025-11-15 16:07:23] [INFO] 
+======================================================================
+[2025-11-15 16:07:23] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-15 16:07:23] [INFO] ======================================================================
+[2025-11-15 16:07:53] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-15 16:07:53] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-15 16:07:53] [INFO]    Partidas activas monitoreando: 0
+[2025-11-15 16:07:53] [INFO]    Replays descargados (total): 0
+[2025-11-15 16:07:53] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-15 16:10:53] [INFO] 
+>>> CICLO #26 <<<
+[2025-11-15 16:10:53] [INFO] 
+======================================================================
+[2025-11-15 16:10:53] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-15 16:10:53] [INFO] ======================================================================
+[2025-11-15 16:11:23] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-15 16:11:23] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-15 16:11:23] [INFO]    Partidas activas monitoreando: 0
+[2025-11-15 16:11:23] [INFO]    Replays descargados (total): 0
+[2025-11-15 16:11:23] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-15 16:14:23] [INFO] 
+>>> CICLO #27 <<<
+[2025-11-15 16:14:23] [INFO] 
+======================================================================
+[2025-11-15 16:14:23] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-15 16:14:23] [INFO] ======================================================================
+[2025-11-15 16:14:53] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-15 16:14:53] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-15 16:14:53] [INFO]    Partidas activas monitoreando: 0
+[2025-11-15 16:14:53] [INFO]    Replays descargados (total): 0
+[2025-11-15 16:14:53] [INFO] 
+⏸️  Esperando 180 segundos...
+[2025-11-15 16:17:53] [INFO] 
+>>> CICLO #28 <<<
+[2025-11-15 16:17:53] [INFO] 
+======================================================================
+[2025-11-15 16:17:53] [INFO] 🔍 CICLO DE MONITOREO
+[2025-11-15 16:17:53] [INFO] ======================================================================
+[2025-11-15 16:18:24] [INFO] ✅ Ciclo completado. En partida ahora: 0
+[2025-11-15 16:18:24] [INFO]    Nuevas partidas monitoreadas: 0
+[2025-11-15 16:18:24] [INFO]    Partidas activas monitoreando: 0
+[2025-11-15 16:18:24] [INFO]    Replays descargados (total): 0
+[2025-11-15 16:18:24] [INFO] 
+⏸️  Esperando 180 segundos...
