@@ -31,7 +31,7 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════
 
-API_KEY         = os.getenv('RIOT_API_KEY', 'RGAPI-609d07b5-26b9-421c-8cf6-68facaf4d4d2')
+API_KEY         = os.getenv('RIOT_API_KEY', 'RGAPI-b8102ee5-59a8-47a5-b2ff-a97a5eb95dbc')
 REGION_PLATFORM = "kr"
 REGION_ROUTING  = "asia"
 PLATFORM_ID     = "KR"
@@ -425,9 +425,10 @@ class MetadataCollector:
                     "stats": {
                         "level": 0, "gold": 0, "current_gold": 0,
                         "minions_killed": 0, "xp": 0,
+                        "health": 0, "health_max": 0,
                         "pos": {"x": 0, "y": 0},
                         "kills": 0, "deaths": 0, "assists": 0,
-                        "damage_done": 0, "damage_taken": 0, "damage_to_champions": 0,
+                        "kill_damage_to_victim": [],
                         "is_dead": False, "in_teamfight": False,
                         "items": [], "trinket": STEALTH_WARD_ID,
                     },
@@ -524,8 +525,8 @@ class MetadataCollector:
             snap_timestamps    = [s['game_time_ms'] for s in self.metadata_history]
             inventories        = build_inventories(item_events, snap_timestamps)
 
-            # ── KDA acumulativo ──
-            kda_history = self._build_kda_history(frames)
+            # ── KDA acumulativo + kill damage ──
+            kda_history, kill_damage_log = self._build_kda_history(frames)
 
             # ── Tracking de objetivos ──
             team_dragons    = {100: [], 200: []}
@@ -588,8 +589,9 @@ class MetadataCollector:
                 p_frames  = frame.get('participantFrames', {})
 
                 inv_at_ts = inventories.get(ms, {})
-                kda_at_ts = self._get_kda_at(kda_history, ms)
-                tf_status = self._detect_teamfight(frame, recent_deaths, frame_ts)
+                kda_at_ts       = self._get_kda_at(kda_history, ms)
+                kill_dmg_at_ts  = self._get_kill_damage_at(kill_damage_log, ms)
+                tf_status       = self._detect_teamfight(frame, recent_deaths, frame_ts)
 
                 for p_data in snap['participants']:
                     puuid = p_data.get('puuid')
@@ -611,13 +613,14 @@ class MetadataCollector:
                         "current_gold":   pf.get('currentGold', 0),
                         "minions_killed": pf.get('minionsKilled', 0) + pf.get('jungleMinionsKilled', 0),
                         "xp":             pf.get('xp', 0),
+                        "health":         pf.get('health', 0),
+                        "health_max":     pf.get('healthMax', 0),
                         "pos": {
                             "x": pf.get('position', {}).get('x', 0),
                             "y": pf.get('position', {}).get('y', 0),
                         },
-                        "damage_done":         pf.get('damageStats', {}).get('totalDamageDone', 0),
-                        "damage_taken":        pf.get('damageStats', {}).get('totalDamageTaken', 0),
-                        "damage_to_champions": pf.get('damageStats', {}).get('totalDamageDoneToChampions', 0),
+                        # Daño hecho a cada víctima en cada kill
+                        "kill_damage_to_victim": kill_dmg_at_ts.get(pid, []),
                         # Items del tracker lineal (todos los jugadores)
                         "items":   player_inv["items"],
                         "trinket": player_inv["trinket"],
@@ -654,6 +657,8 @@ class MetadataCollector:
 
     def _build_kda_history(self, frames: list) -> list:
         running = {pid: {"kills": 0, "deaths": 0, "assists": 0} for pid in range(1, 11)}
+        # kill_damage_log: list of {timestamp, killer_id, victim_id, damage_dealt}
+        kill_damage_log = []
         history = []
         for frame in frames:
             for ev in frame.get('events', []):
@@ -669,11 +674,27 @@ class MetadataCollector:
                 for a in ev.get('assistingParticipantIds', []):
                     if 1 <= a <= 10:
                         running[a]["assists"] += 1
+
+                # Extraer daño que el killer hizo a la víctima
+                victim_dmg_received = ev.get('victimDamageReceived', [])
+                if killer and 1 <= killer <= 10 and victim_dmg_received:
+                    killer_dmg = sum(
+                        d.get('magicDamage', 0) + d.get('physicalDamage', 0) + d.get('trueDamage', 0)
+                        for d in victim_dmg_received
+                        if d.get('participantId') == killer
+                    )
+                    kill_damage_log.append({
+                        "timestamp":    ev_ts,
+                        "killer_id":    killer,
+                        "victim_id":    victim,
+                        "damage_dealt": killer_dmg,
+                    })
+
                 history.append({
                     "timestamp": ev_ts,
                     "kda": {pid: dict(running[pid]) for pid in range(1, 11)},
                 })
-        return history
+        return history, kill_damage_log
 
     def _get_kda_at(self, kda_history: list, ts_ms: int) -> dict:
         result = {pid: {"kills": 0, "deaths": 0, "assists": 0} for pid in range(1, 11)}
@@ -682,6 +703,19 @@ class MetadataCollector:
                 result = entry["kda"]
             else:
                 break
+        return result
+
+    def _get_kill_damage_at(self, kill_damage_log: list, ts_ms: int) -> dict:
+        """Devuelve para cada participantId la lista de kills con daño hecho a la víctima hasta ts_ms."""
+        result = {pid: [] for pid in range(1, 11)}
+        for entry in kill_damage_log:
+            if entry["timestamp"] <= ts_ms:
+                pid = entry["killer_id"]
+                result[pid].append({
+                    "victim_id":    entry["victim_id"],
+                    "damage_dealt": entry["damage_dealt"],
+                    "timestamp_ms": entry["timestamp"],
+                })
         return result
 
     def _build_objectives(self, frame_ts, td, tb, tt, ti, th) -> dict:
@@ -783,9 +817,10 @@ class MetadataCollector:
                 w.writerow([
                     'ms', 'min', 'p_idx', 'team', 'champ',
                     'gold', 'current_gold', 'level', 'cs', 'xp',
+                    'health', 'health_max',
                     'x', 'y',
                     'kills', 'deaths', 'assists',
-                    'damage_done', 'damage_taken', 'damage_to_champions',
+                    'kill_damage_to_victim',
                     'is_dead', 'in_teamfight',
                     'items', 'trinket',
                     'team_dragons', 'team_barons', 'team_towers',
@@ -808,14 +843,16 @@ class MetadataCollector:
                         items_str     = ','.join(str(i) for i in s.get('items', [])) or 'none'
                         t_drag_types  = ','.join(d['type'] for d in t_obj.get('dragons', [])) or 'none'
                         e_drag_types  = ','.join(d['type'] for d in e_obj.get('dragons', [])) or 'none'
+                        # Serializar kill_damage_to_victim como string JSON
+                        kill_dmg_str  = json.dumps(s.get('kill_damage_to_victim', []), separators=(',', ':'))
                         w.writerow([
                             ms, mins, idx, tid, p['champion_id'],
                             s.get('gold', 0), s.get('current_gold', 0),
                             s.get('level', 0), s.get('minions_killed', 0), s.get('xp', 0),
+                            s.get('health', 0), s.get('health_max', 0),
                             s['pos']['x'], s['pos']['y'],
                             s.get('kills', 0), s.get('deaths', 0), s.get('assists', 0),
-                            s.get('damage_done', 0), s.get('damage_taken', 0),
-                            s.get('damage_to_champions', 0),
+                            kill_dmg_str,
                             1 if s.get('is_dead') else 0,
                             1 if s.get('in_teamfight') else 0,
                             items_str, s.get('trinket', STEALTH_WARD_ID),
