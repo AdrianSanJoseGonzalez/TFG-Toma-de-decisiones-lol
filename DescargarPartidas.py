@@ -1,58 +1,29 @@
+#!/usr/bin/env python3
 """
-#  GRABADOR DE REPLAYS VIA SPECTATOR API - MEJORADO PARA IA (PRO) v2.1 - CORREGIDO
-#  ----------------------------------------------------------------------
-#  CORRECCIONES v2.1:
-#    ✅ Sistema de snapshots históricos (items/KDA correctos en cada momento)
-#    ✅ Deep copy de estados para evitar sobrescritura
-#    ✅ Búsqueda correcta de snapshot más cercano
-#    ✅ Lógica de items idéntica al script de análisis que funciona correctamente
-#
-#  SISTEMA DE ITEMS:
-#  =================
-#  Se utiliza la misma lógica exacta del script de análisis que funciona bien:
-#  - ITEM_PURCHASED: Agrega a inventario o actualiza trinket
-#  - ITEM_DESTROYED: Remueve item y procesa evoluciones automáticas
-#  - ITEM_SOLD: Remueve del inventario
-#  - ITEM_UNDO: Revierte compra (trinket o item normal)
-#  - Evoluciones automáticas: Manamune→Muramana, etc.
-#  - Bounty of Worlds: Evoluciona según campeón (Enchanter/Tank/Mage/Catcher)
-#
-#  FUENTES DE DATOS:
-#  =================
-#  
-#  DURANTE LA GRABACIÓN (Spectator API):
-#  ────────────────────────────────────────
-#  - getGameMetaData: Info básica (gameId, participants con PUUIDs, championIds)
-#  - getLastChunkInfo: Estado actual (chunk disponible, si terminó)
-#  - Chunks/Keyframes: Datos binarios del replay
-#  
-#  DESPUÉS DE TERMINAR (Match API v5):
-#  ────────────────────────────────────────
-#  - /matches/{matchId}/timeline: ← AQUÍ VIENEN TODOS LOS DATOS DETALLADOS
-#      * Gold por minuto (totalGold, currentGold)
-#      * Posiciones (x, y)
-#      * Nivel (level)
-#      * CS (minionsKilled + jungleMinionsKilled)
-#      * Items (en cada frame) - CON LÓGICA CORREGIDA
-#      * XP, damage, etc.
-#  
-#  Por eso durante la grabación todo está en 0 - se rellena AL FINAL
-#  usando el Timeline que Riot genera cuando termina la partida.
+GRABADOR DE REPLAYS VIA SPECTATOR API v3.1
+==========================================
+FIXES vs versión anterior:
+  ✅ Items de los 10 jugadores (no solo el espectado)
+  ✅ Snapshots exactamente cada 20s (thread independiente)
+  ✅ Sistema de items lineal: una pasada por PURCHASED/SOLD/UNDO
+  ✅ Participants siempre desde getGameMetaData (tiene los 10)
 """
 
-import requests
-import os
-import sys
-import time
-import random
-import json
-import struct
-import threading
 import argparse
+import binascii
 import csv
+import json
+import mmap
+import os
+import struct
+import sys
+import threading
+import time
 from datetime import datetime
+from typing import List
+
+import requests
 from urllib3.exceptions import InsecureRequestWarning
-from urllib.parse import quote
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
@@ -60,1461 +31,68 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════
 
-API_KEY = os.getenv('RIOT_API_KEY', 'RGAPI-af1b8c1e-d15d-4ebf-bce5-8f4e362ab55a')
+API_KEY         = os.getenv('RIOT_API_KEY', 'RGAPI-90f03e26-bd8f-477d-811f-d73adb7efec0')
 REGION_PLATFORM = "kr"
-REGION_ROUTING = "asia"
-PLATFORM_ID = "KR"
+REGION_ROUTING  = "asia"
+PLATFORM_ID     = "KR"
 
 SPECTATOR_SERVERS = {
     "KR":   "spectator.kr.lol.pvp.net:8080",
     "NA1":  "spectator.na1.lol.pvp.net:8080",
     "EUW1": "spectator.euw1.lol.pvp.net:8080",
 }
-
 SPECTATOR_SERVERS_ALT = {
     "KR":   "spectator.kr.lol.pvp.net:80",
     "NA1":  "spectator.na1.lol.pvp.net:80",
     "EUW1": "spectator.euw1.lol.pvp.net:80",
 }
 
-SAVE_PATH = "F:\\Replays_Recorded_KR"
-LOG_FILE = "spectator_recorder.log"
-METADATA_FILE = "recorded_games_metadata.json"
-STATE_FILE = "recorder_state.json"
+SAVE_PATH              = "F:\Replays_Recorded_KR"
+LOG_FILE               = "spectator_recorder.log"
+STATE_FILE             = "recorder_state.json"
 
-CHECK_INTERVAL = 120
-CHUNK_POLL_INTERVAL = 10
+CHECK_INTERVAL         = 120
 MAX_CONSECUTIVE_ERRORS = 30
-MIN_GAME_DURATION = 15
 
-# Constantes para items
+TRINKETS        = {3340, 3363, 3364, 3362, 3361}
 STEALTH_WARD_ID = 3340
 
-# Estado global
-os.makedirs(SAVE_PATH, exist_ok=True)
-active_recordings = {}
-completed_recordings = set()
-challenger_players = []
+VERBOSE        = False
+DUMP_SNAPSHOTS = False
 
-GLOBAL_SPECTATOR_LOCK = threading.Lock()
+os.makedirs(SAVE_PATH, exist_ok=True)
+
+active_recordings    = {}
+completed_recordings = set()
+challenger_players   = []
+
+GLOBAL_SPECTATOR_LOCK  = threading.Lock()
 LAST_SPECTATOR_REQUEST = 0
-LAST_GAME_END_TIME = 0
+LAST_GAME_END_TIME     = 0
 MIN_SPECTATOR_INTERVAL = 1.5
+
+
+# ══════════════════════════════════════════════════════════════
+# LOGGING
+# ══════════════════════════════════════════════════════════════
 
 def log(message, level="INFO"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_msg = f"[{timestamp}] [{level}] {message}"
-    try:
-        print(log_msg)
-    except:
-        pass
+    log_msg   = f"[{timestamp}] [{level}] {message}"
+    if level != "DEBUG" or VERBOSE:
+        try:
+            print(log_msg)
+        except Exception:
+            pass
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(log_msg + "\n")
-    except:
+    except Exception:
         pass
 
-# ══════════════════════════════════════════════════════════════
-# METADATA COLLECTOR PARA IA - VERSIÓN CORREGIDA v2.1
-# ══════════════════════════════════════════════════════════════
-
-class MetadataCollector:
-    """
-    Extrae datos detallados para entrenamiento de IA cada X segundos.
-    
-    FUENTES DE DATOS:
-    ─────────────────
-    1. DURANTE GRABACIÓN: Solo captura timestamps y estructura base
-       - Participants (PUUIDs, championIds) del Spectator API
-       - Stats quedan en 0 porque el Spectator no los provee en tiempo real
-    
-    2. AL TERMINAR: Descarga Timeline de Match API v5
-       - /matches/{matchId}/timeline contiene TODOS los datos detallados
-       - Gold, posiciones, nivel, CS frame por frame (cada 1 minuto)
-       - Se interpola para llenar los snapshots cada 20s
-    """
-    
-    def __init__(self, recorder, interval=20):
-        self.recorder = recorder
-        self.interval = interval  # Segundos entre snapshots
-        self.metadata_history = []
-        
-        # Sistema de timing ABSOLUTO para captura exacta
-        self.game_start_real_time = None  # Timestamp real cuando empezó
-        self.next_snapshot_time = None    # Próximo snapshot programado (absoluto)
-
-    def collect_metadata(self):
-        """
-        Captura snapshot de la estructura del juego.
-        Los datos dinámicos (gold, pos, etc.) se rellenan AL FINAL con Timeline API.
-        """
-        current_time = time.time()
-        
-        # ═══ INICIALIZACIÓN: Primera llamada ═══
-        if self.game_start_real_time is None:
-            self.game_start_real_time = current_time
-            self.next_snapshot_time = current_time + self.interval
-            log(f"🕐 Sistema de snapshots iniciado (cada {self.interval}s)", "DEBUG")
-            return False
-        
-        # ═══ VERIFICAR SI TOCA CAPTURAR (timing absoluto) ═══
-        if current_time < self.next_snapshot_time:
-            return False  # Todavía no es hora
-        
-        # ═══ PROGRAMAR PRÓXIMO SNAPSHOT (acumulativo) ═══
-        # Esto garantiza intervalos exactos incluso si hay delays
-        self.next_snapshot_time += self.interval
-        
-        # Si nos atrasamos mucho (>2 intervalos), resetear
-        if current_time > self.next_snapshot_time + self.interval:
-            self.next_snapshot_time = current_time + self.interval
-            log(f"⚠️ Retraso detectado, resincronizando timing", "DEBUG")
-            
-        try:
-            # ═══ OBTENER PARTICIPANTS ═══
-            # Prioridad: extra_metadata (viene de active-games) > game_metadata (spectator)
-            participants = self.recorder.extra_metadata.get('participants', [])
-            
-            if not participants and self.recorder.game_metadata:
-                participants = self.recorder.game_metadata.get('participants', [])
-
-            if not participants:
-                # Primer snapshot: pedir metadata
-                response = self.recorder._spectator_request("getGameMetaData", "1/")
-                if response and response.status_code == 200:
-                    self.recorder.game_metadata = response.json()
-                    participants = self.recorder.game_metadata.get('participants', [])
-            
-            if not participants:
-                log(f"⚠️ No hay participantes disponibles aún", "DEBUG")
-                return False
-            
-            # ═══ CALCULAR TIEMPO DE JUEGO ═══
-            game_length = 0
-            
-            # Opción 1: desde game_metadata (spectator)
-            if self.recorder.game_metadata:
-                game_length = self.recorder.game_metadata.get('gameLength', 0)
-            
-            # Opción 2: calcular desde gameStartTime (extra_metadata)
-            if game_length == 0 and self.recorder.extra_metadata:
-                start_time = self.recorder.extra_metadata.get('gameStartTime', 0)
-                if start_time > 0:
-                    game_length = int(time.time() * 1000 - start_time)
-            
-            # Opción 3: calcular desde nuestro start_time
-            if game_length == 0 and self.recorder.start_time:
-                game_length = int((time.time() - self.recorder.start_time) * 1000)
-            
-            # ═══ CONSTRUIR SNAPSHOT ═══
-            snapshot = {
-                "captured_at_iso": datetime.now().isoformat(),
-                "captured_at_unix": current_time,
-                "game_time_ms": game_length,
-                "game_time_min": round(game_length / 60000, 2),
-                "snapshot_number": len(self.metadata_history) + 1,
-                "participants": []
-            }
-            
-            # ═══ AGREGAR PARTICIPANTS (estructura base) ═══
-            for idx, p in enumerate(participants):
-                # Obtener PUUID (prioridad: del participant > buscar en summoner)
-                puuid = p.get('puuid') or p.get('summonerId')
-                
-                # Si viene de active-games, tiene bot y puuid directo
-                # Si viene de spectator metadata, puede no tenerlo
-                if not puuid and 'summonerId' in p:
-                    # Intentar obtener de extra_metadata que tiene más info
-                    summoner_id = p.get('summonerId')
-                    # Buscar en extra_metadata
-                    for ep in self.recorder.extra_metadata.get('participants', []):
-                        if ep.get('summonerId') == summoner_id:
-                            puuid = ep.get('puuid')
-                            break
-                
-                p_data = {
-                    "participant_id": p.get('participantId', idx + 1),
-                    "puuid": puuid,  # ← Ahora debería tener valor
-                    "name": p.get('summonerName') or p.get('riotId', 'Unknown'),
-                    "champion_id": p.get('championId', 0),
-                    "team_id": p.get('teamId', 0),
-                    # Stats en 0 - se llenarán con Timeline
-                    "stats": {
-                        "level": 0,
-                        "gold": 0,
-                        "minions_killed": 0,
-                        "pos": {"x": 0, "y": 0},
-                        "items": []
-                    }
-                }
-                snapshot["participants"].append(p_data)
-                
-            self.metadata_history.append(snapshot)
-            
-            # ═══ LOG DE PROGRESO ═══
-            elapsed_real = current_time - self.game_start_real_time
-            log(f"   📋 Snapshot #{len(self.metadata_history)} @ {snapshot['game_time_min']:.1f}min "
-                f"(real: {elapsed_real:.0f}s, esperado: {len(self.metadata_history) * self.interval}s)", "DEBUG")
-            
-            return True
-            
-        except Exception as e:
-            log(f"   ⚠️ Error capturando metadata: {e}", "DEBUG")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    def enrich_with_timeline(self):
-        """
-        🆕 VERSIÓN CORREGIDA v2.1: Sistema de snapshots históricos
-        
-        Descarga el Timeline completo y rellena TODOS los datos usando
-        snapshots históricos que preservan el estado en cada momento.
-        
-        MEJORAS:
-        ────────
-        - Snapshots históricos por timestamp (no sobrescritura)
-        - Deep copy de estados (listas, dicts)
-        - Búsqueda correcta del snapshot más cercano
-        - Items, KDA, estados de muerte correctos en cada momento
-        """
-        match_id = f"{PLATFORM_ID}_{self.recorder.game_id}"
-        log(f"\n🕵️ ENRIQUECIENDO DATOS CON TIMELINE API (v2.1 CORREGIDO)")
-        log(f"   Match ID: {match_id}")
-        log(f"   Snapshots a rellenar: {len(self.metadata_history)}")
-        
-        # ═══ REINTENTOS ═══
-        timeline = None
-        max_attempts = 6
-        
-        for attempt in range(max_attempts):
-            log(f"   ⏳ Intento {attempt+1}/{max_attempts} de obtener timeline...")
-            
-            if attempt > 0:
-                time.sleep(20)
-            
-            url = f"https://{REGION_ROUTING}.api.riotgames.com/lol/match/v5/matches/{match_id}/timeline"
-            headers = {"X-Riot-Token": API_KEY}
-            
-            try:
-                r = safe_api_call(url, headers)
-                if r and r.status_code == 200:
-                    timeline = r.json()
-                    log(f"   ✅ Timeline obtenido exitosamente")
-                    break
-                elif r and r.status_code == 404:
-                    log(f"   ⏳ Timeline aún no disponible (404)", "DEBUG")
-                    continue
-                else:
-                    log(f"   ⚠️ Error HTTP {r.status_code if r else 'Timeout'}", "DEBUG")
-            except Exception as e:
-                log(f"   ⚠️ Error en request: {e}", "DEBUG")
-        
-        if not timeline:
-            log(f"❌ TIMELINE NO DISPONIBLE tras {max_attempts} intentos", "WARN")
-            return False
-            
-        try:
-            # ═══ PARSEAR TIMELINE ═══
-            info = timeline.get('info', {})
-            frames = info.get('frames', [])
-            participants_map = info.get('participants', [])
-            
-            log(f"   📊 Timeline tiene {len(frames)} frames")
-            
-            # Mapear PUUID ↔ participantId
-            v5_id_to_puuid = {p['participantId']: p['puuid'] for p in participants_map}
-            puuid_to_v5_id = {p['puuid']: p['participantId'] for p in participants_map}
-            
-            # 🔍 DEBUG: Verificar mapeo
-            log(f"\n   🔍 MAPEO DE PARTICIPANTS:")
-            log(f"      Timeline tiene {len(participants_map)} participants")
-            for p in participants_map[:3]:  # Mostrar primeros 3
-                log(f"      - ID {p['participantId']}: {p['puuid'][:20]}...")
-            
-            log(f"\n      Snapshots tienen {len(self.metadata_history[0]['participants']) if self.metadata_history else 0} participants")
-            if self.metadata_history:
-                for p in self.metadata_history[0]['participants'][:3]:
-                    log(f"      - ID {p['participant_id']}: {p['puuid'][:20] if p['puuid'] else 'NULL'}... ({p['name']})")
-            
-            # ═══════════════════════════════════════════════════════════
-            # 🆕 NUEVO SISTEMA: SNAPSHOTS HISTÓRICOS POR TIMESTAMP
-            # ═══════════════════════════════════════════════════════════
-            
-            # Estructura: {timestamp_ms: {participantId: estado_completo}}
-            historical_states = {}
-            
-            # Estado inicial (t=0) - Usando la misma lógica que el script que funciona
-            initial_state = {}
-            for pid in range(1, 11):
-                initial_state[pid] = {
-                    "items": [],
-                    "trinket": STEALTH_WARD_ID,  # Todos empiezan con Stealth Ward
-                    "kills": 0,
-                    "deaths": 0,
-                    "assists": 0,
-                    "is_dead": False,
-                    "respawn_time": 0
-                }
-            # Deep copy para t=0
-            historical_states[0] = {pid: dict(initial_state[pid]) for pid in range(1, 11)}
-            
-            # ═══ TRACKING DE OBJETIVOS POR EQUIPO ═══
-            team_dragons = {100: [], 200: []}
-            team_barons = {100: [], 200: []}
-            team_towers = {100: [], 200: []}
-            team_inhibitors = {100: [], 200: []}
-            team_heralds = {100: [], 200: []}
-            
-            # ═══ TRACKING DE MUERTES RECIENTES (para teamfights) ═══
-            recent_deaths = []
-            
-            # ═══ PROCESAR FRAME POR FRAME Y CREAR SNAPSHOTS HISTÓRICOS ═══
-            log(f"   🔄 Procesando {len(frames)} frames para crear snapshots históricos...")
-            
-            # Contador de eventos de items para debug
-            item_events_count = {"PURCHASED": 0, "DESTROYED": 0, "SOLD": 0, "UNDO": 0}
-            
-            # 🔑 CRÍTICO: Crear snapshots adicionales para cubrir los primeros 5 minutos
-            # El Timeline tiene frames cada 60s, pero nosotros capturamos cada 20s
-            # Necesitamos interpolar para los timestamps entre 0 y el primer frame
-            
-            # Obtener timestamp del primer frame
-            first_frame_timestamp = frames[0].get('timestamp', 0) if frames else 0
-            
-            # Crear snapshots intermedios desde 0 hasta el primer frame
-            # Estos tendrán el estado inicial (0 kills, 0 items, etc.)
-            for intermediate_ts in range(0, first_frame_timestamp, 20000):  # Cada 20s
-                if intermediate_ts not in historical_states:
-                    # Copiar el estado inicial
-                    historical_states[intermediate_ts] = {
-                        pid: dict(initial_state[pid]) for pid in range(1, 11)
-                    }
-            
-            log(f"   📸 Snapshots iniciales creados: 0ms - {first_frame_timestamp}ms")
-            
-            for frame_idx, frame in enumerate(frames):
-                frame_timestamp = frame.get('timestamp', frame_idx * 60000)
-                
-                # 🔑 Copiar estado del frame anterior (deep copy)
-                prev_timestamp = frame_timestamp - 60000
-                if prev_timestamp < 0:
-                    prev_timestamp = 0
-                
-                # 🔑 Crear snapshot NUEVO para este frame
-                current_state = {}
-                for pid in range(1, 11):
-                    if prev_timestamp in historical_states:
-                        prev = historical_states[prev_timestamp][pid]
-                        # 🔑 DEEP COPY - crucial para evitar referencias
-                        current_state[pid] = {
-                            "items": list(prev["items"]),  # ← list() hace copia
-                            "trinket": prev["trinket"],
-                            "kills": prev["kills"],
-                            "deaths": prev["deaths"],
-                            "assists": prev["assists"],
-                            "is_dead": prev["is_dead"],
-                            "respawn_time": prev["respawn_time"]
-                        }
-                    else:
-                        current_state[pid] = {
-                            "items": [],
-                            "trinket": STEALTH_WARD_ID,
-                            "kills": 0,
-                            "deaths": 0,
-                            "assists": 0,
-                            "is_dead": False,
-                            "respawn_time": 0
-                        }
-                
-                # ─── PROCESAR EVENTOS DE ESTE FRAME ───
-                for event in frame.get('events', []):
-                    event_type = event.get('type')
-                    event_timestamp = event.get('timestamp', frame_timestamp)
-                    participant_id = event.get('participantId')
-                    
-                    # ─── KILLS/DEATHS/ASSISTS ───
-                    if event_type == 'CHAMPION_KILL':
-                        killer_id = event.get('killerId')
-                        # Normalizar killer_id (puede ser 0-9 o 1-10)
-                        if killer_id is not None and killer_id >= 0:
-                            norm_killer_id = killer_id if killer_id >= 1 else killer_id + 1
-                            if 1 <= norm_killer_id <= 10:
-                                current_state[norm_killer_id]["kills"] += 1
-                        
-                        victim_id = event.get('victimId')
-                        # Normalizar victim_id
-                        if victim_id is not None and victim_id >= 0:
-                            norm_victim_id = victim_id if victim_id >= 1 else victim_id + 1
-                            if 1 <= norm_victim_id <= 10:
-                                current_state[norm_victim_id]["deaths"] += 1
-                                
-                                # Registrar muerte para teamfights
-                                recent_deaths.append({
-                                    "timestamp": event_timestamp,
-                                    "victim_id": norm_victim_id - 1  # Para teamfight usa 0-indexed
-                                })
-                                
-                                # Calcular respawn time
-                                victim_frame = frame.get('participantFrames', {}).get(str(norm_victim_id), {})
-                                victim_level = victim_frame.get('level', 1)
-                                death_timer = self._calculate_death_timer(victim_level)
-                                respawn_timestamp = event_timestamp + (death_timer * 1000)
-                                
-                                current_state[norm_victim_id]["is_dead"] = True
-                                current_state[norm_victim_id]["respawn_time"] = respawn_timestamp
-                        
-                        # Assists
-                        for assist_id in event.get('assistingParticipantIds', []):
-                            if assist_id is not None and assist_id >= 0:
-                                norm_assist_id = assist_id if assist_id >= 1 else assist_id + 1
-                                if 1 <= norm_assist_id <= 10:
-                                    current_state[norm_assist_id]["assists"] += 1
-                    
-                    # ─── ITEMS (usando lógica del script que funciona) ───
-                    # 🔑 CRITICAL: participantId en eventos puede ser 0-9 O 1-10 dependiendo del evento
-                    # Los frames siempre usan 1-10, pero eventos de items pueden usar 0-9
-                    if participant_id is not None and 0 <= participant_id <= 10:
-                        item_id = event.get('itemId')
-                        
-                        # Normalizar: si participantId es 0-9, convertir a 1-10
-                        normalized_pid = participant_id if participant_id >= 1 else participant_id + 1
-                        
-                        if normalized_pid < 1 or normalized_pid > 10:
-                            continue  # Seguridad extra
-                        
-                        # === ITEM_PURCHASED ===
-                        if event_type == 'ITEM_PURCHASED':
-                            item_events_count["PURCHASED"] += 1
-                            if self._is_trinket(item_id):
-                                current_state[normalized_pid]["trinket"] = item_id
-                            elif item_id not in current_state[normalized_pid]["items"] and len(current_state[normalized_pid]["items"]) < 6:
-                                current_state[normalized_pid]["items"].append(item_id)
-                                # Debug primeros frames
-                                if frame_idx < 10:
-                                    log(f"      🛒 Frame {frame_idx}: P{normalized_pid} compró item {item_id}", "DEBUG")
-                        
-                        # === ITEM_DESTROYED ===
-                        elif event_type == 'ITEM_DESTROYED':
-                            item_events_count["DESTROYED"] += 1
-                            # Trinkets
-                            if self._is_trinket(item_id):
-                                if current_state[normalized_pid]["trinket"] == item_id:
-                                    current_state[normalized_pid]["trinket"] = STEALTH_WARD_ID
-                            # Items normales
-                            elif item_id in current_state[normalized_pid]["items"]:
-                                current_state[normalized_pid]["items"].remove(item_id)
-                            
-                            # === EVOLUCIONES AUTOMÁTICAS (misma lógica que script) ===
-                            evolutions = {
-                                3004: 3042,  # Manamune → Muramana
-                                3003: 3040,  # Archangel's → Seraph's Embrace
-                                3865: 3866,  # World Atlas → Runic Compass
-                                3866: 3867,  # Runic Compass → Bounty of Worlds
-                                3010: 3013,  # Mejai's Soulstealer
-                            }
-                            
-                            if item_id in evolutions:
-                                new_id = evolutions[item_id]
-                                if new_id not in current_state[normalized_pid]["items"] and len(current_state[normalized_pid]["items"]) < 6:
-                                    current_state[normalized_pid]["items"].append(new_id)
-                            
-                            # === Bounty of Worlds (3867) → Evolución específica ===
-                            elif item_id == 3867:
-                                champ_name = "Unknown"
-                                if hasattr(self.recorder, 'extra_metadata'):
-                                    participants = self.recorder.extra_metadata.get('participants', [])
-                                    for p in participants:
-                                        # Usar normalized_pid
-                                        if p.get('participantId') == normalized_pid:
-                                            champ_name = p.get('championName', 'Unknown')
-                                            break
-                                
-                                evolved_item = self._get_support_evolution(champ_name)
-                                if item_id in current_state[normalized_pid]["items"]:
-                                    current_state[normalized_pid]["items"].remove(item_id)
-                                if evolved_item not in current_state[normalized_pid]["items"] and len(current_state[normalized_pid]["items"]) < 6:
-                                    current_state[normalized_pid]["items"].append(evolved_item)
-                        
-                        # === ITEM_SOLD ===
-                        elif event_type == 'ITEM_SOLD':
-                            item_events_count["SOLD"] += 1
-                            if item_id in current_state[normalized_pid]["items"]:
-                                current_state[normalized_pid]["items"].remove(item_id)
-                        
-                        # === ITEM_UNDO ===
-                        elif event_type == 'ITEM_UNDO':
-                            item_events_count["UNDO"] += 1
-                            before_id = event.get('beforeId')
-                            if before_id:
-                                if self._is_trinket(before_id):
-                                    if current_state[normalized_pid]["trinket"] == before_id:
-                                        current_state[normalized_pid]["trinket"] = STEALTH_WARD_ID
-                                elif before_id in current_state[normalized_pid]["items"]:
-                                    current_state[normalized_pid]["items"].remove(before_id)
-                    
-                    # ─── DRAGONES ───
-                    if event_type == 'ELITE_MONSTER_KILL':
-                        monster_type = event.get('monsterType')
-                        killer_team = event.get('killerTeamId')
-                        
-                        if monster_type == 'DRAGON':
-                            dragon_subtype = event.get('monsterSubType', 'UNKNOWN_DRAGON')
-                            if killer_team in [100, 200]:
-                                team_dragons[killer_team].append({
-                                    "type": dragon_subtype,
-                                    "timestamp": event_timestamp,
-                                    "minute": round(event_timestamp / 60000, 1)
-                                })
-                        
-                        elif monster_type == 'BARON_NASHOR':
-                            if killer_team in [100, 200]:
-                                team_barons[killer_team].append({
-                                    "timestamp": event_timestamp,
-                                    "minute": round(event_timestamp / 60000, 1)
-                                })
-                        
-                        elif monster_type == 'RIFTHERALD':
-                            if killer_team in [100, 200]:
-                                team_heralds[killer_team].append({
-                                    "timestamp": event_timestamp,
-                                    "minute": round(event_timestamp / 60000, 1)
-                                })
-                    
-                    # ─── TORRES ───
-                    if event_type == 'BUILDING_KILL':
-                        building_type = event.get('buildingType')
-                        killer_team = event.get('killerTeamId')
-                        lane = event.get('laneType', 'UNKNOWN')
-                        tower_type = event.get('towerType', 'UNKNOWN')
-                        
-                        if building_type == 'TOWER_BUILDING':
-                            if killer_team in [100, 200]:
-                                team_towers[killer_team].append({
-                                    "lane": lane,
-                                    "tier": tower_type,
-                                    "timestamp": event_timestamp,
-                                    "minute": round(event_timestamp / 60000, 1)
-                                })
-                        
-                        elif building_type == 'INHIBITOR_BUILDING':
-                            if killer_team in [100, 200]:
-                                team_inhibitors[killer_team].append({
-                                    "lane": lane,
-                                    "timestamp": event_timestamp,
-                                    "minute": round(event_timestamp / 60000, 1)
-                                })
-                
-                # ─── ACTUALIZAR ESTADOS DE RESPAWN ───
-                for pid in range(1, 11):
-                    if current_state[pid]["is_dead"] and frame_timestamp >= current_state[pid]["respawn_time"]:
-                        current_state[pid]["is_dead"] = False
-                
-                # 🔑 GUARDAR SNAPSHOT HISTÓRICO (clave del fix)
-                historical_states[frame_timestamp] = current_state
-                
-                # 🔑 INTERPOLAR: Crear snapshots cada 20s entre este frame y el siguiente
-                # Esto asegura que TODOS los snapshots tengan datos, no solo los de cada 60s
-                if frame_idx < len(frames) - 1:
-                    next_frame_timestamp = frames[frame_idx + 1].get('timestamp', (frame_idx + 1) * 60000)
-                    
-                    # Crear snapshots intermedios cada 20s
-                    for intermediate_ts in range(frame_timestamp + 20000, next_frame_timestamp, 20000):
-                        if intermediate_ts not in historical_states:
-                            # Copiar el estado actual (no ha cambiado hasta el próximo frame)
-                            historical_states[intermediate_ts] = {
-                                pid: {
-                                    "items": list(current_state[pid]["items"]),
-                                    "trinket": current_state[pid]["trinket"],
-                                    "kills": current_state[pid]["kills"],
-                                    "deaths": current_state[pid]["deaths"],
-                                    "assists": current_state[pid]["assists"],
-                                    "is_dead": current_state[pid]["is_dead"],
-                                    "respawn_time": current_state[pid]["respawn_time"]
-                                }
-                                for pid in range(1, 11)
-                            }
-                
-                if frame_idx % 5 == 0:
-                    log(f"   📸 Snapshot histórico @ {frame_timestamp/60000:.1f}min", "DEBUG")
-            
-            log(f"   ✅ {len(historical_states)} snapshots históricos creados")
-            log(f"   📊 Eventos de items procesados: PURCHASED={item_events_count['PURCHASED']}, DESTROYED={item_events_count['DESTROYED']}, SOLD={item_events_count['SOLD']}, UNDO={item_events_count['UNDO']}")
-            
-            # Debug: Mostrar items finales de cada jugador
-            if frames:
-                last_frame_ts = frames[-1].get('timestamp', 0)
-                if last_frame_ts in historical_states:
-                    log(f"\n   📦 ITEMS AL FINAL DEL JUEGO (frame {len(frames)-1}):")
-                    for pid in range(1, 11):
-                        items = historical_states[last_frame_ts][pid]["items"]
-                        trinket = historical_states[last_frame_ts][pid]["trinket"]
-                        log(f"      P{pid}: {len(items)} items {items}, trinket={trinket}")
-            
-            # ═══ CORREGIR PUUIDs EN SNAPSHOTS ═══
-            for snap in self.metadata_history:
-                for p_data in snap['participants']:
-                    if not p_data['puuid']:
-                        pid = p_data['participant_id']
-                        if pid in v5_id_to_puuid:
-                            p_data['puuid'] = v5_id_to_puuid[pid]
-            
-            # ═══════════════════════════════════════════════════════════
-            # 🔑 SINCRONIZACIÓN DE TIMESTAMPS
-            # ═══════════════════════════════════════════════════════════
-            # PROBLEMA: Durante la grabación, capturamos desde el momento que detectamos
-            # la partida (incluye pantalla de carga, ~3-5 min). Pero el Timeline API
-            # solo tiene datos desde que el juego REAL empieza (jugadores salen de base).
-            #
-            # SOLUCIÓN: Ajustar los timestamps de nuestros snapshots para que coincidan
-            # con el Timeline. Descartamos snapshots que caen ANTES del primer frame.
-            
-            if frames and self.metadata_history:
-                first_timeline_ts = frames[0].get('timestamp', 0)
-                
-                log(f"\n   🔄 SINCRONIZANDO TIMESTAMPS:")
-                log(f"      Primer snapshot capturado: {self.metadata_history[0]['game_time_ms']}ms")
-                log(f"      Primer frame Timeline: {first_timeline_ts}ms")
-                
-                # Calcular el offset (diferencia entre nuestros snapshots y el Timeline)
-                # Si capturamos desde -180000ms (3min antes) y Timeline empieza en 0ms,
-                # el offset es +180000ms
-                
-                # Encontrar el primer snapshot que tiene datos válidos
-                first_valid_snap = None
-                for snap in self.metadata_history:
-                    # Un snapshot es válido si tiene datos de frames (gold, level, etc.)
-                    # o si su timestamp está dentro del rango del Timeline
-                    if snap['game_time_ms'] >= first_timeline_ts:
-                        first_valid_snap = snap
-                        break
-                
-                if first_valid_snap:
-                    # Offset = cuánto ajustar cada snapshot
-                    offset = first_valid_snap['game_time_ms'] - first_timeline_ts
-                    
-                    log(f"      Offset detectado: {offset}ms ({offset/60000:.1f}min)")
-                    log(f"      Ajustando {len(self.metadata_history)} snapshots...")
-                    
-                    # Ajustar todos los snapshots
-                    for snap in self.metadata_history:
-                        snap['game_time_ms'] -= offset
-                        snap['game_time_min'] = round(snap['game_time_ms'] / 60000, 2)
-                    
-                    # Filtrar snapshots que quedaron negativos (estaban antes del juego real)
-                    original_count = len(self.metadata_history)
-                    self.metadata_history = [s for s in self.metadata_history if s['game_time_ms'] >= 0]
-                    removed_count = original_count - len(self.metadata_history)
-                    
-                    if removed_count > 0:
-                        log(f"      ✂️  Eliminados {removed_count} snapshots pre-juego (pantalla de carga)")
-                    
-                    log(f"      ✅ Snapshots sincronizados: {len(self.metadata_history)} válidos")
-                    log(f"      📊 Nuevo rango: {self.metadata_history[0]['game_time_ms']}ms - {self.metadata_history[-1]['game_time_ms']}ms")
-
-            
-            # ═══════════════════════════════════════════════════════════
-            # 🔑 RELLENAR SNAPSHOTS BUSCANDO EL ESTADO HISTÓRICO MÁS CERCANO
-            # ═══════════════════════════════════════════════════════════
-            
-            log(f"\n   🔄 Rellenando {len(self.metadata_history)} snapshots con datos históricos...")
-            
-            # Debug: Mostrar rango de timestamps
-            if self.metadata_history:
-                first_snap_ms = self.metadata_history[0]['game_time_ms']
-                last_snap_ms = self.metadata_history[-1]['game_time_ms']
-                log(f"   📊 Rango snapshots: {first_snap_ms}ms ({first_snap_ms/60000:.1f}min) - {last_snap_ms}ms ({last_snap_ms/60000:.1f}min)")
-            
-            available_hist_timestamps = sorted(historical_states.keys())
-            if available_hist_timestamps:
-                log(f"   📊 Rango históricos: {available_hist_timestamps[0]}ms - {available_hist_timestamps[-1]}ms")
-                log(f"   📊 Total históricos disponibles: {len(available_hist_timestamps)}")
-            
-            for snap_idx, snap in enumerate(self.metadata_history):
-                ms = snap['game_time_ms']
-                
-                # Buscar frame más cercano
-                frame_idx = min(int(ms / 60000), len(frames) - 1)
-                if frame_idx < 0:
-                    continue
-                
-                frame = frames[frame_idx]
-                frame_timestamp = frame.get('timestamp', frame_idx * 60000)
-                p_frames = frame.get('participantFrames', {})
-                
-                # 🔑 Buscar snapshot histórico más cercano (SIN PASARSE)
-                available_timestamps = sorted([t for t in historical_states.keys() if t <= ms])
-                if not available_timestamps:
-                    # No hay histórico disponible - usar estado inicial
-                    log(f"   ⚠️  Snapshot #{snap_idx+1} @ {ms}ms: SIN HISTÓRICO, usando estado inicial", "DEBUG")
-                    historical_timestamp = 0
-                else:
-                    historical_timestamp = available_timestamps[-1]
-                
-                historical_snapshot = historical_states[historical_timestamp]
-                
-                if snap_idx % 10 == 0 or snap_idx < 5:  # Debug primeros 5 y cada 10
-                    log(f"   ⏱️  Snapshot #{snap_idx+1} @ {ms}ms ({ms/60000:.1f}min) usando histórico de {historical_timestamp}ms ({historical_timestamp/60000:.1f}min)", "DEBUG")
-                
-                # ─── DETECTAR TEAMFIGHT ───
-                teamfight_status = self._detect_teamfight(frame, recent_deaths, frame_timestamp)
-                
-                # ─── RELLENAR STATS POR PARTICIPANTE ───
-                items_found_count = 0
-                items_missing_count = 0
-                
-                for p_data in snap['participants']:
-                    puuid = p_data['puuid']
-                    p_name = p_data['name']
-                    
-                    if not puuid:
-                        log(f"      ⚠️  {p_name}: Sin PUUID", "DEBUG") if snap_idx == 0 else None
-                        continue
-                    
-                    v5_pid = puuid_to_v5_id.get(puuid)
-                    if not v5_pid:
-                        log(f"      ⚠️  {p_name} ({puuid[:20]}...): PUUID no encontrado en Timeline", "DEBUG") if snap_idx == 0 else None
-                        continue
-                    
-                    v5_pid_str = str(v5_pid)
-                    if v5_pid_str in p_frames:
-                        pf = p_frames[v5_pid_str]
-                        
-                        # 🔑 OBTENER DATOS HISTÓRICOS
-                        if v5_pid not in historical_snapshot:
-                            log(f"      ❌ {p_name}: v5_pid {v5_pid} NO existe en historical_snapshot (keys: {list(historical_snapshot.keys())})", "WARN")
-                            continue
-                        
-                        hist = historical_snapshot[v5_pid]
-                        
-                        # Debug primer snapshot
-                        if snap_idx == 0:
-                            log(f"      ✅ {p_name} (v5_pid={v5_pid}): {len(hist['items'])} items", "DEBUG")
-                            if hist['items']:
-                                items_found_count += 1
-                            else:
-                                items_missing_count += 1
-                        
-                        # Stats de frame + estado histórico
-                        p_data['stats'].update({
-                            "level": pf.get('level', 0),
-                            "gold": pf.get('totalGold', 0),
-                            "current_gold": pf.get('currentGold', 0),
-                            "minions_killed": pf.get('minionsKilled', 0) + pf.get('jungleMinionsKilled', 0),
-                            "pos": {
-                                "x": pf.get('position', {}).get('x', 0),
-                                "y": pf.get('position', {}).get('y', 0)
-                            },
-                            "xp": pf.get('xp', 0),
-                            
-                            # Daño
-                            "damage_done": pf.get('damageStats', {}).get('totalDamageDone', 0),
-                            "damage_taken": pf.get('damageStats', {}).get('totalDamageTaken', 0),
-                            "damage_to_champions": pf.get('damageStats', {}).get('totalDamageDoneToChampions', 0),
-                            
-                            # 🔑 Items + Trinket (del snapshot histórico - FIX CRÍTICO)
-                            "items": list(hist["items"]),  # Copia para evitar mutación
-                            "trinket": hist["trinket"],
-                            
-                            # 🔑 KDA (del snapshot histórico - FIX CRÍTICO)
-                            "kills": hist["kills"],
-                            "deaths": hist["deaths"],
-                            "assists": hist["assists"],
-                            
-                            # 🔑 Estado (del snapshot histórico - FIX CRÍTICO)
-                            "is_dead": hist["is_dead"],
-                            "respawn_time": hist["respawn_time"],
-                            
-                            # Teamfight
-                            "in_teamfight": teamfight_status.get(v5_pid - 1, False)
-                        })
-                    else:
-                        log(f"      ⚠️  {p_name}: v5_pid_str '{v5_pid_str}' no en p_frames (keys: {list(p_frames.keys())[:5]}...)", "DEBUG") if snap_idx == 0 else None
-                
-                if snap_idx == 0:
-                    log(f"\n   📊 RESUMEN SNAPSHOT #1: {items_found_count} jugadores con items, {items_missing_count} sin items")
-                
-                # ─── AÑADIR OBJETIVOS DE EQUIPO AL SNAPSHOT ───
-                snap['objectives'] = {
-                    "blue_team": {
-                        "dragons": [
-                            {"type": d['type'], "minute": d['minute']}
-                            for d in team_dragons[100] if d['timestamp'] <= frame_timestamp
-                        ],
-                        "barons": [
-                            {"minute": b['minute']}
-                            for b in team_barons[100] if b['timestamp'] <= frame_timestamp
-                        ],
-                        "towers": [
-                            {"lane": t['lane'], "tier": t['tier'], "minute": t['minute']}
-                            for t in team_towers[100] if t['timestamp'] <= frame_timestamp
-                        ],
-                        "inhibitors": [
-                            {"lane": i['lane'], "minute": i['minute']}
-                            for i in team_inhibitors[100] if i['timestamp'] <= frame_timestamp
-                        ],
-                        "heralds": [
-                            {"minute": h['minute']}
-                            for h in team_heralds[100] if h['timestamp'] <= frame_timestamp
-                        ]
-                    },
-                    "red_team": {
-                        "dragons": [
-                            {"type": d['type'], "minute": d['minute']}
-                            for d in team_dragons[200] if d['timestamp'] <= frame_timestamp
-                        ],
-                        "barons": [
-                            {"minute": b['minute']}
-                            for b in team_barons[200] if b['timestamp'] <= frame_timestamp
-                        ],
-                        "towers": [
-                            {"lane": t['lane'], "tier": t['tier'], "minute": t['minute']}
-                            for t in team_towers[200] if t['timestamp'] <= frame_timestamp
-                        ],
-                        "inhibitors": [
-                            {"lane": i['lane'], "minute": i['minute']}
-                            for i in team_inhibitors[200] if i['timestamp'] <= frame_timestamp
-                        ],
-                        "heralds": [
-                            {"minute": h['minute']}
-                            for h in team_heralds[200] if h['timestamp'] <= frame_timestamp
-                        ]
-                    }
-                }
-            
-            # ═══ VALIDACIÓN (opcional - para debug) ═══
-            if len(self.metadata_history) >= 3:
-                log(f"\n   🔍 VALIDACIÓN DE DATOS:")
-                snap1 = self.metadata_history[0]
-                snap_mid = self.metadata_history[len(self.metadata_history)//2]
-                snap_last = self.metadata_history[-1]
-                
-                for snap in [snap1, snap_mid, snap_last]:
-                    p1 = snap['participants'][0]['stats']
-                    log(f"      @ {snap['game_time_min']:.1f}min: Items={p1['items']}, KDA={p1['kills']}/{p1['deaths']}/{p1['assists']}")
-            
-            log(f"\n✅ {len(self.metadata_history)} snapshots enriquecidos con sistema histórico v2.1")
-            return True
-            
-        except Exception as e:
-            log(f"❌ Error procesando Timeline: {e}", "ERROR")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    def _calculate_death_timer(self, level):
-        """Calcula tiempo de respawn según nivel"""
-        if level <= 6:
-            return 4 + (2 * level)
-        else:
-            return 21 + (2.5 * (level - 6))
-    
-    def _is_trinket(self, item_id):
-        """Verifica si un item es trinket"""
-        return item_id in [3340, 3363, 3364, 3362, 3361]
-    
-    def _get_support_evolution(self, champion_name):
-        """
-        Retorna la evolución correcta de Bounty of Worlds según campeón.
-        Lógica idéntica al script que funciona.
-        """
-        SUPPORT_EVOLUTIONS = {
-            # Enchanters (3877)
-            "Lulu": 3877, "Janna": 3877, "Nami": 3877, "Sona": 3877,
-            "Seraphine": 3877, "Milio": 3877, "Yuumi": 3877, "Soraka": 3877,
-            
-            # Tanks (3876)
-            "Leona": 3876, "Nautilus": 3876, "Rell": 3876, "Alistar": 3876,
-            "Blitzcrank": 3876, "Braum": 3876, "Taric": 3876, "TahmKench": 3876,
-            "Tahm Kench": 3876,  # Ambas versiones del nombre
-            
-            # Mages (3870)
-            "Zyra": 3870, "Brand": 3870, "Velkoz": 3870, "Xerath": 3870, "Karma": 3870,
-            "VelKoz": 3870,  # Ambas versiones
-            
-            # Catchers (3871)
-            "Bard": 3871, "RenataGlasc": 3871, "Renata Glasc": 3871, "Thresh": 3871,
-            "Renata": 3871,  # Versión corta
-            
-            # Default (3869) - Senna y otros
-            "Senna": 3869,
-        }
-        
-        # Default si no se encuentra
-        DEFAULT_EVOLUTION = 3869
-        return SUPPORT_EVOLUTIONS.get(champion_name, DEFAULT_EVOLUTION)
-    
-    def _detect_teamfight(self, frame, recent_deaths, current_timestamp):
-        """
-        Detecta teamfights activos.
-        Retorna dict {participant_id_0indexed: bool}
-        """
-        TEAMFIGHT_DISTANCE = 3000
-        TEAMFIGHT_TIME_WINDOW = 10000
-        
-        participant_frames = frame.get("participantFrames", {})
-        
-        # Separar por equipos
-        team_100 = []
-        team_200 = []
-        
-        for pid_str, pf in participant_frames.items():
-            pid = int(pid_str)
-            team_id = 100 if pid <= 5 else 200
-            position = pf.get("position", {"x": 0, "y": 0})
-            
-            if team_id == 100:
-                team_100.append({"id": pid - 1, "pos": position})
-            else:
-                team_200.append({"id": pid - 1, "pos": position})
-        
-        # Contar jugadores cercanos
-        def count_nearby_players(team_players):
-            if len(team_players) < 4:
-                return []
-            
-            nearby_groups = []
-            for i, player1 in enumerate(team_players):
-                group = [player1["id"]]
-                for j, player2 in enumerate(team_players):
-                    if i != j:
-                        dx = player1["pos"]["x"] - player2["pos"]["x"]
-                        dy = player1["pos"]["y"] - player2["pos"]["y"]
-                        dist = (dx**2 + dy**2) ** 0.5
-                        
-                        if dist <= TEAMFIGHT_DISTANCE:
-                            group.append(player2["id"])
-                
-                if len(group) >= 4:
-                    nearby_groups.append(group)
-            
-            return nearby_groups
-        
-        blue_groups = count_nearby_players(team_100)
-        red_groups = count_nearby_players(team_200)
-        
-        # Muertes recientes
-        recent_deaths_in_window = [
-            d for d in recent_deaths 
-            if current_timestamp - d["timestamp"] <= TEAMFIGHT_TIME_WINDOW
-        ]
-        
-        # Determinar teamfight
-        participants_in_tf = set()
-        
-        if blue_groups and red_groups and len(recent_deaths_in_window) > 0:
-            for group in blue_groups:
-                participants_in_tf.update(group)
-            for group in red_groups:
-                participants_in_tf.update(group)
-        
-        # Retornar resultado
-        result = {}
-        for i in range(10):
-            result[i] = i in participants_in_tf
-        
-        return result
-
-    def save_final_reports(self):
-        """Genera archivos finales: JSON completo + CSV para IA + Timeline mejorado."""
-        if not self.metadata_history:
-            log("⚠️ No hay snapshots para guardar", "WARN")
-            return
-        
-        log(f"\n💾 Generando archivos finales...")
-            
-        # ═══ 1. JSON COMPLETO (formato interno) ═══
-        history_path = os.path.join(self.recorder.temp_dir, "ai_metadata_history.json")
-        with open(history_path, 'w', encoding='utf-8') as f:
-            json.dump(self.metadata_history, f, indent=2, ensure_ascii=False)
-        log(f"   ✅ JSON interno: ai_metadata_history.json ({len(self.metadata_history)} snapshots)")
-        
-        # ═══ 2. TIMELINE MEJORADO (formato Riot compatible) ═══
-        self._generate_improved_timeline()
-            
-        # ═══ 3. CSV PARA ENTRENAMIENTO (COMPLETO) ═══
-        csv_path = os.path.join(self.recorder.temp_dir, "ai_training_timeline.csv")
-        try:
-            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                
-                # Header COMPLETO
-                writer.writerow([
-                    'ms', 'min', 'p_idx', 'team', 'champ',
-                    'gold', 'current_gold', 'level', 'cs', 'xp',
-                    'x', 'y',
-                    'kills', 'deaths', 'assists',
-                    'damage_done', 'damage_taken', 'damage_to_champions',
-                    'is_dead', 'in_teamfight',
-                    'items', 'trinket',
-                    # Objetivos de equipo (counts)
-                    'team_dragons_count', 'team_barons_count', 'team_towers_count', 'team_inhibitors_count', 'team_heralds_count',
-                    'enemy_dragons_count', 'enemy_barons_count', 'enemy_towers_count', 'enemy_inhibitors_count', 'enemy_heralds_count',
-                    # Dragones por tipo
-                    'team_dragons_types', 'enemy_dragons_types'
-                ])
-                
-                # Datos
-                for snap in self.metadata_history:
-                    ms = snap['game_time_ms']
-                    minutes = snap['game_time_min']
-                    
-                    # Objetivos por equipo
-                    objectives = snap.get('objectives', {})
-                    blue_obj = objectives.get('blue_team', {})
-                    red_obj = objectives.get('red_team', {})
-                    
-                    for idx, p in enumerate(snap['participants']):
-                        s = p['stats']
-                        team_id = p['team_id']
-                        
-                        # Determinar objetivos del equipo y del enemigo
-                        if team_id == 100:  # Blue team
-                            team_obj = blue_obj
-                            enemy_obj = red_obj
-                        else:  # Red team
-                            team_obj = red_obj
-                            enemy_obj = blue_obj
-                        
-                        # Items
-                        items_str = ','.join([str(item_id) for item_id in s.get('items', [])])
-                        if not items_str:
-                            items_str = 'none'
-                        
-                        # Trinket
-                        trinket = s.get('trinket', 3340)
-                        
-                        # Dragones (tipos separados por coma)
-                        team_dragons_types = ','.join([d['type'] for d in team_obj.get('dragons', [])])
-                        if not team_dragons_types:
-                            team_dragons_types = 'none'
-                        
-                        enemy_dragons_types = ','.join([d['type'] for d in enemy_obj.get('dragons', [])])
-                        if not enemy_dragons_types:
-                            enemy_dragons_types = 'none'
-                        
-                        writer.writerow([
-                            ms,
-                            minutes,
-                            idx,
-                            team_id,
-                            p['champion_id'],
-                            
-                            # Gold & Level
-                            s.get('gold', 0),
-                            s.get('current_gold', 0),
-                            s.get('level', 0),
-                            s.get('minions_killed', 0),
-                            s.get('xp', 0),
-                            
-                            # Posición
-                            s['pos']['x'],
-                            s['pos']['y'],
-                            
-                            # KDA
-                            s.get('kills', 0),
-                            s.get('deaths', 0),
-                            s.get('assists', 0),
-                            
-                            # Daño
-                            s.get('damage_done', 0),
-                            s.get('damage_taken', 0),
-                            s.get('damage_to_champions', 0),
-                            
-                            # Estado
-                            1 if s.get('is_dead', False) else 0,
-                            1 if s.get('in_teamfight', False) else 0,
-                            
-                            # Items + Trinket
-                            items_str,
-                            trinket,
-                            
-                            # Objetivos del equipo (counts)
-                            len(team_obj.get('dragons', [])),
-                            len(team_obj.get('barons', [])),
-                            len(team_obj.get('towers', [])),
-                            len(team_obj.get('inhibitors', [])),
-                            len(team_obj.get('heralds', [])),
-                            
-                            # Objetivos del enemigo (counts)
-                            len(enemy_obj.get('dragons', [])),
-                            len(enemy_obj.get('barons', [])),
-                            len(enemy_obj.get('towers', [])),
-                            len(enemy_obj.get('inhibitors', [])),
-                            len(enemy_obj.get('heralds', [])),
-                            
-                            # Dragones por tipo
-                            team_dragons_types,
-                            enemy_dragons_types
-                        ])
-            
-            log(f"   ✅ CSV: ai_training_timeline.csv (DATASET COMPLETO)")
-            
-            # ═══ ESTADÍSTICAS FINALES ═══
-            total_rows = len(self.metadata_history) * 10
-            duration_min = self.metadata_history[-1]['game_time_min'] if self.metadata_history else 0
-            
-            log(f"\n📊 ESTADÍSTICAS:")
-            log(f"   Snapshots: {len(self.metadata_history)}")
-            log(f"   Rows en CSV: {total_rows}")
-            log(f"   Duración juego: {duration_min:.1f} min")
-            log(f"   Columnas: 32 (gold, KDA, daño, items, trinket, objetivos, teamfights)")
-            
-        except Exception as e:
-            log(f"❌ Error generando CSV: {e}", "ERROR")
-            import traceback
-            traceback.print_exc()
-    
-    def _generate_improved_timeline(self):
-        """
-        Genera un Timeline en formato Riot API pero MEJORADO:
-        - Frames cada 20 segundos (vs 60s de Riot)
-        - Incluye eventos de hechizos de invocador (Smite, Ignite, Flash, etc.)
-        - Compatible con herramientas que leen el formato de Riot
-        """
-        try:
-            log(f"\n   🔧 Generando Timeline mejorado (formato Riot)...")
-            
-            # Estructura base del Timeline (compatible con Riot API)
-            timeline = {
-                "metadata": {
-                    "dataVersion": "2",
-                    "matchId": f"{PLATFORM_ID}_{self.recorder.game_id}",
-                    "participants": []
-                },
-                "info": {
-                    "endOfGameResult": "GameComplete",
-                    "frameInterval": 20000,  # ← 20s en lugar de 60s
-                    "frames": []
-                }
-            }
-            
-            # ═══ METADATA: Lista de PUUIDs ═══
-            if self.metadata_history:
-                for p in self.metadata_history[0]['participants']:
-                    if p['puuid']:
-                        timeline['metadata']['participants'].append(p['puuid'])
-            
-            # ═══ FRAMES: Convertir cada snapshot a formato Riot ═══
-            for snap_idx, snap in enumerate(self.metadata_history):
-                frame = {
-                    "events": [],  # ← Aquí irían eventos de items, kills, hechizos
-                    "participantFrames": {},
-                    "timestamp": snap['game_time_ms']
-                }
-                
-                # Agregar participantFrames (stats de cada jugador)
-                for p_idx, p_data in enumerate(snap['participants']):
-                    participant_id = p_data['participant_id']
-                    stats = p_data['stats']
-                    
-                    # Formato Riot para participantFrames
-                    frame['participantFrames'][str(participant_id)] = {
-                        "championStats": {
-                            "abilityHaste": 0,
-                            "abilityPower": 0,
-                            "armor": 0,
-                            "armorPen": 0,
-                            "armorPenPercent": 0,
-                            "attackDamage": 0,
-                            "attackSpeed": 100,
-                            "bonusArmorPenPercent": 0,
-                            "bonusMagicPenPercent": 0,
-                            "ccReduction": 0,
-                            "cooldownReduction": 0,
-                            "health": 0,
-                            "healthMax": 0,
-                            "healthRegen": 0,
-                            "lifesteal": 0,
-                            "magicPen": 0,
-                            "magicPenPercent": 0,
-                            "magicResist": 0,
-                            "movementSpeed": 0,
-                            "omnivamp": 0,
-                            "physicalVamp": 0,
-                            "power": 0,
-                            "powerMax": 0,
-                            "powerRegen": 0,
-                            "spellVamp": 0
-                        },
-                        "currentGold": stats.get('current_gold', 0),
-                        "damageStats": {
-                            "magicDamageDone": 0,
-                            "magicDamageDoneToChampions": 0,
-                            "magicDamageTaken": 0,
-                            "physicalDamageDone": stats.get('damage_done', 0),
-                            "physicalDamageDoneToChampions": stats.get('damage_to_champions', 0),
-                            "physicalDamageTaken": stats.get('damage_taken', 0),
-                            "totalDamageDone": stats.get('damage_done', 0),
-                            "totalDamageDoneToChampions": stats.get('damage_to_champions', 0),
-                            "totalDamageTaken": stats.get('damage_taken', 0),
-                            "trueDamageDone": 0,
-                            "trueDamageDoneToChampions": 0,
-                            "trueDamageTaken": 0
-                        },
-                        "goldPerSecond": 0,
-                        "jungleMinionsKilled": 0,
-                        "level": stats.get('level', 1),
-                        "minionsKilled": stats.get('minions_killed', 0),
-                        "participantId": participant_id,
-                        "position": {
-                            "x": stats.get('pos', {}).get('x', 0),
-                            "y": stats.get('pos', {}).get('y', 0)
-                        },
-                        "timeEnemySpentControlled": 0,
-                        "totalGold": stats.get('gold', 0),
-                        "xp": stats.get('xp', 0)
-                    }
-                
-                # TODO: Agregar eventos (items, kills, hechizos) comparando con frame anterior
-                # Por ahora solo agregamos la estructura
-                
-                timeline['info']['frames'].append(frame)
-            
-            # Guardar Timeline mejorado
-            timeline_path = os.path.join(self.recorder.temp_dir, "improved_timeline.json")
-            with open(timeline_path, 'w', encoding='utf-8') as f:
-                json.dump(timeline, f, indent=2, ensure_ascii=False)
-            
-            log(f"   ✅ Timeline mejorado: improved_timeline.json")
-            log(f"      - Frames: {len(timeline['info']['frames'])} (cada 20s)")
-            log(f"      - Duración: {timeline['info']['frames'][-1]['timestamp']/60000:.1f} minutos")
-            
-            return True
-            
-        except Exception as e:
-            log(f"   ⚠️ Error generando Timeline mejorado: {e}", "WARN")
-            import traceback
-            traceback.print_exc()
-            return False
 
 # ══════════════════════════════════════════════════════════════
-# SPECTATOR RECORDER (CORE ROBUSTO)
-# ══════════════════════════════════════════════════════════════
-
-class SpectatorRecorder:
-    def __init__(self, game_id, encryption_key, platform_id=PLATFORM_ID, 
-                 player_name="Unknown", extra_metadata=None, metadata_only=False):
-        self.game_id = game_id
-        self.encryption_key = encryption_key
-        self.platform_id = platform_id
-        self.player_name = player_name
-        self.extra_metadata = extra_metadata or {}
-        self.metadata_only = metadata_only
-        
-        self.spectator_url = f"http://{SPECTATOR_SERVERS.get(platform_id, 'spectator.kr.lol.pvp.net:8080')}"
-        
-        self.chunks = {}
-        self.keyframes = {}
-        self.game_metadata = None
-        
-        self.recording = False
-        self.start_time = None
-        self.end_time = None
-        self.consecutive_errors = 0
-        self.total_chunks = 0
-        self.total_keyframes = 0
-        self.game_length_ms = 0
-        
-        self.start_game_chunk_id = 1
-        self.end_startup_chunk_id = 0
-        self.keyframe_interval = 60000
-        
-        self.temp_dir = os.path.join(SAVE_PATH, f"temp_{game_id}")
-        os.makedirs(self.temp_dir, exist_ok=True)
-        
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "Mozilla/5.0 RiotClient/12.0.0"})
-
-    def _spectator_request(self, method, params="", timeout=15):
-        """Request con manejo de 429 y fallback de port."""
-        global LAST_SPECTATOR_REQUEST
-        
-        max_retries = 3
-        for attempt in range(max_retries + 1):
-            with GLOBAL_SPECTATOR_LOCK:
-                elapsed = time.time() - LAST_SPECTATOR_REQUEST
-                if elapsed < MIN_SPECTATOR_INTERVAL:
-                    time.sleep(MIN_SPECTATOR_INTERVAL - elapsed)
-                LAST_SPECTATOR_REQUEST = time.time()
-
-            url = f"{self.spectator_url}/observer-mode/rest/consumer/{method}/{self.platform_id}/{self.game_id}/{params}token"
-            try:
-                r = self.session.get(url, timeout=timeout)
-                if r.status_code == 429:
-                    wait = 5 * (attempt + 1)
-                    log(f"⚠️ 429 RateLimit. Esperando {wait}s...", "WARN")
-                    time.sleep(wait)
-                    continue
-                return r
-            except:
-                if attempt == 0:  # Primer fallo, probar puerto 80
-                    alt = SPECTATOR_SERVERS_ALT.get(self.platform_id)
-                    if alt:
-                        self.spectator_url = f"http://{alt}"
-                        continue
-                if attempt < max_retries:
-                    time.sleep(2)
-                    continue
-        return None
-
-    def start_recording(self):
-        log(f"\n🔴 INICIANDO GRABACIÓN: {self.game_id} ({self.player_name})")
-        self.recording = True
-        self.start_time = time.time()
-        
-        collector = MetadataCollector(self, interval=20)
-        
-        # Metadata inicial
-        r_meta = self._spectator_request("getGameMetaData", "1/")
-        if r_meta and r_meta.status_code == 200:
-            self.game_metadata = r_meta.json()
-            self.start_game_chunk_id = self.game_metadata.get('startGameChunkId', 1)
-            self.end_startup_chunk_id = self.game_metadata.get('endStartupChunkId', 0)
-            self.keyframe_interval = self.game_metadata.get('interestScore', 60000)
-            with open(os.path.join(self.temp_dir, "metadata.json"), 'w') as f:
-                json.dump(self.game_metadata, f, indent=2)
-
-        last_chunk_reported = 0
-        while self.recording:
-            # ═══ CAPTURA DE METADATA PARA IA ═══
-            collector.collect_metadata()
-            
-            # ═══ POLLING DE CHUNKS ═══
-            r_info = self._spectator_request("getLastChunkInfo", "0/")
-            if not r_info or r_info.status_code != 200:
-                self.consecutive_errors += 1
-                if self.consecutive_errors > MAX_CONSECUTIVE_ERRORS:
-                    break
-                time.sleep(10)
-                continue
-            
-            self.consecutive_errors = 0
-            info = r_info.json()
-            chunk_id = info.get('chunkId', 0)
-            kf_id = info.get('keyFrameId', 0)
-            end_id = info.get('endGameChunkId', 0)
-            
-            # Descargar Chunks pendientes
-            if not self.metadata_only:
-                for cid in range(max(1, chunk_id - 5), chunk_id + 1):
-                    if cid not in self.chunks:
-                        r_c = self._spectator_request("getGameDataChunk", f"{cid}/")
-                        if r_c and r_c.status_code == 200:
-                            self.chunks[cid] = r_c.content
-                            with open(os.path.join(self.temp_dir, f"chunk_{cid}.bin"), 'wb') as f:
-                                f.write(r_c.content)
-                            self.total_chunks += 1
-
-                # Descargar Keyframes pendientes
-                for kid in range(max(1, kf_id - 1), kf_id + 1):
-                    if kid not in self.keyframes:
-                        r_k = self._spectator_request("getKeyFrame", f"{kid}/")
-                        if r_k and r_k.status_code == 200:
-                            self.keyframes[kid] = r_k.content
-                            with open(os.path.join(self.temp_dir, f"kf_{kid}.bin"), 'wb') as f:
-                                f.write(r_k.content)
-                            self.total_keyframes += 1
-
-            if chunk_id > last_chunk_reported:
-                elapsed_min = (time.time() - self.start_time) / 60
-                log(f"   📡 Chunk {chunk_id} | KF {kf_id} | {elapsed_min:.1f}min grabando")
-                last_chunk_reported = chunk_id
-
-            if end_id > 0 and chunk_id >= end_id:
-                log(f"🏁 Partida terminada (Chunk {end_id})")
-                break
-                
-            time.sleep(min(info.get('nextAvailableChunk', 10000) / 1000, 20))
-
-        self.end_time = time.time()
-        self.recording = False
-        self.game_length_ms = int((self.end_time - self.start_time) * 1000)
-        
-        # ═══ PASO CRÍTICO: ENRIQUECER CON TIMELINE ═══
-        log(f"\n{'='*65}")
-        log(f"📊 FASE DE ENRIQUECIMIENTO DE DATOS (v2.1 CORREGIDO)")
-        log(f"{'='*65}")
-        collector.enrich_with_timeline()
-        collector.save_final_reports()
-        
-        # ═══ ENSAMBLAR ROFL ═══
-        if not self.metadata_only:
-            return self.assemble_rofl()
-        else:
-            log("✅ Modo metadata-only: No se ensambló .rofl")
-            return None
-
-    def assemble_rofl(self):
-        """Ensamblado binario completo del archivo .rofl."""
-        if not self.chunks:
-            log("⚠️ No hay chunks para ensamblar", "WARN")
-            return None
-            
-        log(f"\n🔧 Ensamblando .rofl...")
-        try:
-            # Metadata
-            meta = {
-                "gameId": self.game_id,
-                "platformId": self.platform_id,
-                "encryptionKey": self.encryption_key
-            }
-            if self.game_metadata:
-                meta.update(self.game_metadata)
-            meta_b = json.dumps(meta, separators=(',', ':')).encode('utf-8')
-            
-            # Entradas de Datos
-            entries = []
-            for k in sorted(self.keyframes.keys()):
-                entries.append({'id': k, 'type': 1, 'data': self.keyframes[k]})
-            for i, c in enumerate(sorted(self.chunks.keys())):
-                nxt = sorted(self.chunks.keys())[i+1] if i+1 < len(self.chunks) else 0
-                entries.append({'id': c, 'type': 2, 'data': self.chunks[c], 'next': nxt})
-
-            # Payload
-            payload_data = bytearray()
-            h_size = len(entries) * 17
-            off = 0
-            for e in entries:
-                payload_data += struct.pack('<IBIII', e['id'], e['type'], len(e['data']), e.get('next', 0), off + h_size)
-                off += len(e['data'])
-            for e in entries:
-                payload_data += e['data']
-
-            # Payload Header
-            enc_b = self.encryption_key.encode('utf-8')
-            p_header = struct.pack('<QIIIIIIH', self.game_id, self.game_length_ms, len(self.keyframes), len(self.chunks), 
-                                   self.end_startup_chunk_id, self.start_game_chunk_id, 60000, len(enc_b)) + enc_b
-            
-            # File Header
-            h_len = 288
-            m_off = h_len
-            m_len = len(meta_b)
-            ph_off = m_off + m_len
-            ph_len = len(p_header)
-            p_off = ph_off + ph_len
-            f_len = p_off + len(payload_data)
-            
-            f_header = b'RIOT\x00\x00' + b'\x00' * 256 + struct.pack('<HIIIIIII', h_len, f_len, m_off, m_len, ph_off, ph_len, p_off, 0)
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            path = os.path.join(SAVE_PATH, f"KR_{self.game_id}_{timestamp}.rofl")
-            with open(path, 'wb') as f:
-                f.write(f_header)
-                f.write(meta_b)
-                f.write(p_header)
-                f.write(payload_data)
-            
-            log(f"✅ Replay guardado: {path} ({f_len/1024/1024:.2f} MB)")
-            return path
-        except Exception as e:
-            log(f"❌ Error ensamblado: {e}", "ERROR")
-            import traceback
-            traceback.print_exc()
-            return None
-
-# ══════════════════════════════════════════════════════════════
-# FUNCIONES RIOT API
+# RIOT API HELPERS
 # ══════════════════════════════════════════════════════════════
 
 def safe_api_call(url, headers, max_retries=3):
@@ -1525,39 +103,1226 @@ def safe_api_call(url, headers, max_retries=3):
                 time.sleep(10)
                 continue
             return r
-        except:
+        except Exception:
             time.sleep(2)
     return None
 
+
+def get_timeline(game_id: int):
+    match_id = f"{PLATFORM_ID}_{game_id}"
+    url      = f"https://{REGION_ROUTING}.api.riotgames.com/lol/match/v5/matches/{match_id}/timeline"
+    headers  = {"X-Riot-Token": API_KEY}
+    for attempt in range(6):
+        if attempt > 0:
+            time.sleep(20)
+        log(f"   ⏳ Timeline intento {attempt+1}/6...")
+        try:
+            r = safe_api_call(url, headers)
+            if r and r.status_code == 200:
+                log("   ✅ Timeline obtenido")
+                return r.json()
+            elif r and r.status_code == 404:
+                log("   ⏳ No disponible aún (404)")
+            else:
+                log(f"   ⚠️ HTTP {r.status_code if r else 'Timeout'}")
+        except Exception as e:
+            log(f"   ⚠️ Error: {e}")
+    log("❌ Timeline no disponible tras 6 intentos", "WARN")
+    return None
+
+
+CHAMPIONS_DATA = {}
+def get_champions_data():
+    global CHAMPIONS_DATA
+    if CHAMPIONS_DATA: return CHAMPIONS_DATA
+    try:
+        res = requests.get("https://ddragon.leagueoflegends.com/api/versions.json", timeout=5)
+        latest_version = res.json()[0]
+        res = requests.get(f"https://ddragon.leagueoflegends.com/cdn/{latest_version}/data/en_US/champion.json", timeout=5)
+        champs = res.json()["data"]
+        for k, v in champs.items():
+            CHAMPIONS_DATA[int(v["key"])] = v["name"]
+    except Exception as e:
+        log(f"   ⚠️ Error al obtener datos de campeones DDragon: {e}", "DEBUG")
+    return CHAMPIONS_DATA
+
+def get_match_info(game_id: int):
+    match_id = f"{PLATFORM_ID}_{game_id}"
+    url      = f"https://{REGION_ROUTING}.api.riotgames.com/lol/match/v5/matches/{match_id}"
+    headers  = {"X-Riot-Token": API_KEY}
+    for attempt in range(6):
+        if attempt > 0:
+            time.sleep(20)
+        log(f"   ⏳ Match Info intento {attempt+1}/6...")
+        try:
+            r = safe_api_call(url, headers)
+            if r and r.status_code == 200:
+                log("   ✅ Match Info obtenido")
+                return r.json()
+            elif r and r.status_code == 404:
+                log("   ⏳ No disponible aún (404)")
+            else:
+                log(f"   ⚠️ HTTP {r.status_code if r else 'Timeout'}")
+        except Exception as e:
+            log(f"   ⚠️ Error: {e}")
+    log("❌ Match Info no disponible tras 6 intentos", "WARN")
+    return None
+
+
 def get_summoner_name_from_puuid(puuid):
-    """Utiliza la Account-V1 para obtener el nombre real (Riot ID #TAG)."""
     url = f"https://{REGION_ROUTING}.api.riotgames.com/riot/account/v1/accounts/by-puuid/{puuid}"
-    r = safe_api_call(url, {"X-Riot-Token": API_KEY})
+    r   = safe_api_call(url, {"X-Riot-Token": API_KEY})
     if r and r.status_code == 200:
-        data = r.json()
-        return f"{data.get('gameName')}#{data.get('tagLine')}"
+        d = r.json()
+        return f"{d.get('gameName')}#{d.get('tagLine')}"
     return "Unknown"
+
 
 def check_active_game(puuid):
     url = f"https://{REGION_PLATFORM}.api.riotgames.com/lol/spectator/v5/active-games/by-summoner/{puuid}"
-    r = safe_api_call(url, {"X-Riot-Token": API_KEY})
+    r   = safe_api_call(url, {"X-Riot-Token": API_KEY})
     return r.json() if r and r.status_code == 200 else None
 
+
 def get_challenger_and_grandmaster_list():
-    log("🏆 Cargando el Top de jugadores de KR (Challenger + GM)...")
+    log("🏆 Cargando Top jugadores KR (Challenger + GM)...")
     players = []
     headers = {"X-Riot-Token": API_KEY}
-    
-    r_c = safe_api_call(f"https://{REGION_PLATFORM}.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5", headers)
+    r_c = safe_api_call(
+        f"https://{REGION_PLATFORM}.api.riotgames.com/lol/league/v4/challengerleagues/by-queue/RANKED_SOLO_5x5",
+        headers
+    )
     if r_c and r_c.status_code == 200:
         players.extend(r_c.json()['entries'])
-        
-    r_gm = safe_api_call(f"https://{REGION_PLATFORM}.api.riotgames.com/lol/league/v4/grandmasterleagues/by-queue/RANKED_SOLO_5x5", headers)
+    r_gm = safe_api_call(
+        f"https://{REGION_PLATFORM}.api.riotgames.com/lol/league/v4/grandmasterleagues/by-queue/RANKED_SOLO_5x5",
+        headers
+    )
     if r_gm and r_gm.status_code == 200:
         players.extend(sorted(r_gm.json()['entries'], key=lambda x: x['leaguePoints'], reverse=True)[:200])
-        
     log(f"✅ {len(players)} jugadores en lista de monitoreo.")
     return players
+
+
+# ══════════════════════════════════════════════════════════════
+# ITEM TRACKER — pasada lineal
+# ══════════════════════════════════════════════════════════════
+
+def extract_item_events(timeline: dict) -> list:
+    """
+    Extrae ITEM_PURCHASED / ITEM_SOLD / ITEM_UNDO del Timeline,
+    ordenados por timestamp.
+    """
+    events = []
+    for frame in timeline.get("info", {}).get("frames", []):
+        for ev in frame.get("events", []):
+            t = ev.get("type", "")
+            if t in ("ITEM_PURCHASED", "ITEM_SOLD", "ITEM_UNDO"):
+                events.append({
+                    "timestamp":     ev.get("timestamp", 0),
+                    "participantId": ev.get("participantId"),
+                    "type":          t,
+                    "itemId":        ev.get("itemId"),
+                    "beforeId":      ev.get("beforeId"),
+                })
+    events.sort(key=lambda e: e["timestamp"])
+    bought = sum(1 for e in events if e["type"] == "ITEM_PURCHASED")
+    sold   = sum(1 for e in events if e["type"] == "ITEM_SOLD")
+    undos  = sum(1 for e in events if e["type"] == "ITEM_UNDO")
+    log(f"   📦 Eventos items: PURCHASED={bought} SOLD={sold} UNDO={undos}")
+    return events
+
+
+def build_inventories(item_events: list, snapshot_timestamps_ms: list) -> dict:
+    """
+    Avanza linealmente por los eventos y para cada timestamp
+    guarda una COPIA del inventario en ese momento exacto.
+
+    Retorna:
+      { timestamp_ms: { participantId(1-10): {"items":[...], "trinket": id} } }
+    """
+    inventory = {
+        pid: {"items": [], "trinket": STEALTH_WARD_ID}
+        for pid in range(1, 11)
+    }
+
+    result       = {}
+    sorted_ts    = sorted(snapshot_timestamps_ms)
+    ev_idx       = 0
+    total_events = len(item_events)
+
+    for snap_ts in sorted_ts:
+        # Aplicar todos los eventos hasta este timestamp
+        while ev_idx < total_events and item_events[ev_idx]["timestamp"] <= snap_ts:
+            ev  = item_events[ev_idx]
+            pid = ev["participantId"]
+            ev_idx += 1
+
+            if pid is None or not (1 <= pid <= 10):
+                continue
+
+            item_id = ev["itemId"]
+            inv     = inventory[pid]
+
+            if ev["type"] == "ITEM_PURCHASED":
+                if item_id in TRINKETS:
+                    inv["trinket"] = item_id
+                elif item_id not in inv["items"] and len(inv["items"]) < 6:
+                    inv["items"].append(item_id)
+
+            elif ev["type"] == "ITEM_SOLD":
+                if item_id in inv["items"]:
+                    inv["items"].remove(item_id)
+
+            elif ev["type"] == "ITEM_UNDO":
+                before_id = ev.get("beforeId")
+                if before_id:
+                    if before_id in TRINKETS:
+                        inv["trinket"] = STEALTH_WARD_ID
+                    elif before_id in inv["items"]:
+                        inv["items"].remove(before_id)
+
+        # Guardar COPIA (no referencia)
+        result[snap_ts] = {
+            pid: {
+                "items":   list(inventory[pid]["items"]),
+                "trinket": inventory[pid]["trinket"],
+            }
+            for pid in range(1, 11)
+        }
+
+    return result
+
+
+# ══════════════════════════════════════════════════════════════
+# METADATA COLLECTOR
+# ══════════════════════════════════════════════════════════════
+
+class MetadataCollector:
+    """
+    Captura snapshots cada 20s en un THREAD PROPIO (independiente
+    del polling de chunks). Así el intervalo es siempre exacto.
+
+    Al terminar la partida, enrich_with_timeline() rellena todos
+    los datos desde la Match API v5 Timeline.
+    """
+
+    def __init__(self, recorder, interval: int = 20):
+        self.recorder         = recorder
+        self.interval         = interval
+        self.metadata_history = []
+        self._stop_event      = threading.Event()
+        self._thread          = None
+        # Sesion propia: NO usa GLOBAL_SPECTATOR_LOCK, no bloquea el chunk polling
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": "Mozilla/5.0 RiotClient/12.0.0"})
+
+    # ─────────────────────────────────────────
+    # Control del thread de captura
+    # ─────────────────────────────────────────
+
+    def start(self):
+        """Lanza el thread de captura en background."""
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+        log(f"🕐 Thread de snapshots iniciado (cada {self.interval}s)")
+
+    def stop(self):
+        """Detiene el thread de captura."""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+        log(f"🛑 Thread de snapshots detenido ({len(self.metadata_history)} snapshots capturados)")
+
+    def _capture_loop(self):
+        """
+        Bucle interno: cada `interval` segundos captura un snapshot.
+        Si no hay participants aun, reintenta cada 5s hasta tenerlos
+        antes de entrar al ritmo normal de 20s.
+        """
+        # Debug: mostrar que hay en extra_metadata al arrancar
+        extra = self.recorder.extra_metadata
+        extra_parts = extra.get('participants', [])
+        log(f"   🔍 extra_metadata: {len(extra_parts)} participants, keys={list(extra.keys())[:8]}")
+        if extra_parts:
+            log(f"      Ejemplo P1: {extra_parts[0]}", "DEBUG")
+
+        # Esperar participants con reintentos cada 5s (sin bloquear stop_event)
+        log("   🔍 Esperando participants...")
+        while not self._stop_event.is_set():
+            parts = self._get_participants()
+            if parts:
+                log(f"   ✅ {len(parts)} participants listos, iniciando snapshots")
+                break
+            log("   ⏳ Participants no disponibles aun, reintentando en 5s")
+            for _ in range(5):
+                if self._stop_event.is_set():
+                    return
+                time.sleep(1)
+
+        # Bucle principal de snapshots cada 20s
+        while not self._stop_event.is_set():
+            self._capture_one()
+            for _ in range(self.interval):
+                if self._stop_event.is_set():
+                    break
+                time.sleep(1)
+
+    # ─────────────────────────────────────────
+    # Obtener los 10 participants
+    # ─────────────────────────────────────────
+
+    def _get_participants(self) -> list:
+        """
+        Orden de prioridad para obtener los 10 participants:
+        1. extra_metadata (active-games): siempre disponible desde el inicio
+        2. game_metadata (getGameMetaData Spectator): disponible algo despues
+        """
+        # ── FUENTE 1: active-games (disponible desde el primer momento) ──
+        # El endpoint active-games devuelve los 10 participantes siempre.
+        extra = self.recorder.extra_metadata.get('participants', [])
+        if len(extra) == 10:
+            return extra
+
+        # Si tiene menos de 10 pero algo, usarlo igual (bots, custom games)
+        if extra:
+            return extra
+
+        # ── FUENTE 2: getGameMetaData del Spectator (puede tardar) ──
+        if self.recorder.game_metadata:
+            parts = self.recorder.game_metadata.get('participants', [])
+            if parts:
+                return parts
+
+        # ── FUENTE 3: pedir getGameMetaData con sesion propia (sin lock) ──
+        rec = self.recorder
+        url = (f"{rec.spectator_url}/observer-mode/rest/consumer/getGameMetaData"
+               f"/{rec.platform_id}/{rec.game_id}/1/token")
+        try:
+            r = self._session.get(url, timeout=10)
+            if r and r.status_code == 200:
+                rec.game_metadata = r.json()
+                parts = rec.game_metadata.get('participants', [])
+                if parts:
+                    log(f"   📋 Metadata obtenida por collector ({len(parts)} participants)", "DEBUG")
+                    return parts
+        except Exception as e:
+            log(f"   ⚠️ Error obteniendo metadata: {e}", "DEBUG")
+
+        return []
+
+    def _enrich_puuids(self, participants: list):
+        """
+        Rellena PUUIDs faltantes en la lista de participants del Spectator
+        usando los datos de extra_metadata (active-games).
+        """
+        extra_parts = self.recorder.extra_metadata.get('participants', [])
+        if not extra_parts:
+            return
+        # Índice por summonerId para búsqueda rápida
+        by_summoner = {ep.get('summonerId'): ep for ep in extra_parts}
+        for p in participants:
+            if not p.get('puuid'):
+                sid = p.get('summonerId')
+                ep  = by_summoner.get(sid)
+                if ep:
+                    p['puuid'] = ep.get('puuid', '')
+
+    # ─────────────────────────────────────────
+    # Captura de un snapshot
+    # ─────────────────────────────────────────
+
+    def _capture_one(self):
+        try:
+            participants = self._get_participants()
+            if not participants:
+                log("   ⚠️ Sin participants, snapshot omitido", "DEBUG")
+                return
+
+            # Calcular tiempo de juego
+            game_length_ms = self._get_game_time_ms()
+
+            snapshot = {
+                "captured_at_iso":  datetime.now().isoformat(),
+                "captured_at_unix": time.time(),
+                "game_time_ms":     game_length_ms,
+                "game_time_min":    round(game_length_ms / 60000, 2),
+                "snapshot_number":  len(self.metadata_history) + 1,
+                "participants":     [],
+            }
+
+            for idx, p in enumerate(participants):
+                puuid = p.get('puuid') or ''
+                p_data = {
+                    "participant_id": p.get('participantId', idx + 1),
+                    "puuid":          puuid,
+                    "name":           p.get('summonerName') or p.get('riotId', 'Unknown'),
+                    "champion_id":    p.get('championId', 0),
+                    "team_id":        p.get('teamId', 0),
+                    "stats": {
+                        "level": 0, "gold": 0, "current_gold": 0,
+                        "minions_killed": 0, "xp": 0,
+                        "health": 0, "health_max": 0,
+                        "pos": {"x": 0, "y": 0},
+                        "kills": 0, "deaths": 0, "assists": 0,
+                        "recent_kills": [],
+                        "is_dead": False, "in_teamfight": False,
+                        "items": [], "trinket": STEALTH_WARD_ID,
+                    },
+                }
+                snapshot["participants"].append(p_data)
+
+            self.metadata_history.append(snapshot)
+            log(f"   📋 Snapshot #{len(self.metadata_history)} "
+                f"@ {snapshot['game_time_min']:.1f}min "
+                f"({len(participants)} jugadores)", "DEBUG")
+
+        except Exception as e:
+            log(f"   ⚠️ Error capturando snapshot: {e}", "DEBUG")
+
+    def _get_game_time_ms(self) -> int:
+        """Calcula el tiempo de juego en ms con varias fuentes."""
+        # Fuente 1: gameLength del metadata del Spectator
+        if self.recorder.game_metadata:
+            gl = self.recorder.game_metadata.get('gameLength', 0)
+            if gl > 0:
+                return gl
+
+        # Fuente 2: gameStartTime del active-games
+        start = self.recorder.extra_metadata.get('gameStartTime', 0)
+        if start > 0:
+            return int(time.time() * 1000 - start)
+
+        # Fuente 3: tiempo desde que empezamos a grabar
+        if self.recorder.start_time:
+            return int((time.time() - self.recorder.start_time) * 1000)
+
+        return 0
+
+    # ─────────────────────────────────────────
+    # Enriquecimiento con Timeline (al final)
+    # ─────────────────────────────────────────
+
+    def enrich_with_timeline(self):
+        log(f"\n🕵️ ENRIQUECIENDO CON TIMELINE API v3.1")
+        log(f"   Snapshots capturados: {len(self.metadata_history)}")
+
+        if not self.metadata_history:
+            log("⚠️ Sin snapshots", "WARN")
+            return False
+
+        timeline = get_timeline(self.recorder.game_id)
+        if not timeline:
+            return False
+
+        match_info = get_match_info(self.recorder.game_id)
+        
+        champs_db = get_champions_data()
+        puuid_to_role = {}
+        puuid_to_champname = {}
+        winning_team = 0
+        
+        if match_info:
+            for t in match_info.get("info", {}).get("teams", []):
+                if t.get("win"):
+                    winning_team = t.get("teamId")
+                    
+            for p in match_info.get("info", {}).get("participants", []):
+                puuid = p.get("puuid")
+                role_raw = p.get("teamPosition", "")
+                
+                role = ""
+                if role_raw == "TOP": role = "top"
+                elif role_raw == "JUNGLE": role = "jungla"
+                elif role_raw == "MIDDLE": role = "mid"
+                elif role_raw == "BOTTOM": role = "adc"
+                elif role_raw == "UTILITY": role = "support"
+                
+                if puuid:
+                    puuid_to_role[puuid] = role
+                    puuid_to_champname[puuid] = p.get("championName", "")
+
+        try:
+            info   = timeline.get('info', {})
+            frames = info.get('frames', [])
+            log(f"   📊 Timeline: {len(frames)} frames")
+
+            # ── Mapeo PUUID <-> participantId del Timeline ──
+            tl_parts     = info.get('participants', [])
+            puuid_to_pid = {p['puuid']: p['participantId'] for p in tl_parts if isinstance(p, dict)}
+            pid_to_puuid = {p['participantId']: p['puuid']  for p in tl_parts if isinstance(p, dict)}
+            log(f"   🔗 {len(puuid_to_pid)} PUUIDs mapeados desde Timeline")
+
+            # ── Corregir PUUIDs faltantes en snapshots usando el Timeline ──
+            for snap in self.metadata_history:
+                for p_data in snap['participants']:
+                    if not p_data['puuid']:
+                        pid = p_data['participant_id']
+                        if pid in pid_to_puuid:
+                            p_data['puuid'] = pid_to_puuid[pid]
+                            
+                    puuid = p_data.get('puuid', '')
+                    c_id  = p_data.get('champion_id', 0)
+                    
+                    c_name = puuid_to_champname.get(puuid)
+                    if not c_name:
+                        c_name = champs_db.get(c_id, "Unknown")
+                        
+                    p_data['champion_name'] = c_name
+                    p_data['role'] = puuid_to_role.get(puuid, "")
+
+            # ── Sincronizar timestamps ──
+            # El Timeline empieza cuando los jugadores salen de la base (t≈0).
+            # Nuestros snapshots pueden incluir la pantalla de carga (tiempo negativo).
+            if frames:
+                first_tl_ts   = frames[0].get('timestamp', 0)
+                first_valid   = next((s for s in self.metadata_history
+                                      if s['game_time_ms'] >= first_tl_ts), None)
+                if first_valid:
+                    offset = first_valid['game_time_ms'] - first_tl_ts
+                    log(f"   🔄 Offset: {offset}ms ({offset/60000:.1f}min)")
+                    for snap in self.metadata_history:
+                        snap['game_time_ms']  -= offset
+                        snap['game_time_min']  = round(snap['game_time_ms'] / 60000, 2)
+                    before = len(self.metadata_history)
+                    self.metadata_history = [s for s in self.metadata_history
+                                             if s['game_time_ms'] >= 0]
+                    removed = before - len(self.metadata_history)
+                    if removed:
+                        log(f"   ✂️  {removed} snapshots pre-juego eliminados")
+                    log(f"   ✅ {len(self.metadata_history)} snapshots válidos tras sincronización")
+
+            # ══════════════════════════════════════════
+            # ITEMS: pasada lineal (los 10 jugadores)
+            # ══════════════════════════════════════════
+            item_events        = extract_item_events(timeline)
+            snap_timestamps    = [s['game_time_ms'] for s in self.metadata_history]
+            inventories        = build_inventories(item_events, snap_timestamps)
+
+            # ── KDA acumulativo + kill damage ──
+            kda_history, kill_damage_log = self._build_kda_history(frames)
+
+            # ── Tracking de objetivos y sus tiempos de reaparición ──
+            # Tiempos base en ms: Dragón 300000ms (5m), Baron 360000ms (6m), Inhib 300000ms (5m)
+            # El Heraldo reaparece una vez si muere antes del min 13:45, con cd de 360000 (6m)
+            team_dragons    = {100: [], 200: []}
+            team_barons     = {100: [], 200: []}
+            team_towers     = {100: [], 200: []}
+            team_inhibitors = {100: [], 200: []}
+            team_heralds    = {100: [], 200: []}
+            
+            global_dragon_respawn = 0
+            global_baron_respawn  = 0
+            global_herald_respawn = 0
+            
+            # Para inhibidores, guardamos el respawn por línea y equipo: "100_MID": timestamp
+            inhibitor_respawns = {}
+            
+            recent_deaths   = []
+            participant_death_history = {i: [] for i in range(1, 11)}
+
+            for frame in frames:
+                frame_ts = frame.get('timestamp', 0)
+                for ev in frame.get('events', []):
+                    et    = ev.get('type')
+                    ev_ts = ev.get('timestamp', frame_ts)
+
+                    if et == 'CHAMPION_KILL':
+                        vid = ev.get('victimId')
+                        if vid and 1 <= vid <= 10:
+                            recent_deaths.append({"timestamp": ev_ts, "victim_id": vid - 1})
+                            # Calcular respawn time con formula Patch 14.16+
+                            victim_pf = frame.get('participantFrames', {}).get(str(vid), {})
+                            victim_level = victim_pf.get('level', 1)
+                            death_timer = self._calculate_death_timer(victim_level, ev_ts)
+                            participant_death_history[vid].append({
+                                "death_timestamp": ev_ts,
+                                "respawn_time": ev_ts + (death_timer * 1000)
+                            })
+
+                    elif et == 'ELITE_MONSTER_KILL':
+                        monster = ev.get('monsterType')
+                        team    = ev.get('killerTeamId')
+                        
+                        if monster == 'DRAGON':
+                            global_dragon_respawn = ev_ts + 300000 # 5 min
+                            if team in (100, 200):
+                                team_dragons[team].append({
+                                    "type":      ev.get('monsterSubType', 'UNKNOWN'),
+                                    "timestamp": ev_ts,
+                                    "minute":    round(ev_ts / 60000, 1),
+                                })
+                        elif monster == 'BARON_NASHOR':
+                            global_baron_respawn = ev_ts + 360000 # 6 min
+                            if team in (100, 200):
+                                team_barons[team].append({"timestamp": ev_ts, "minute": round(ev_ts / 60000, 1)})
+                        elif monster == 'RIFTHERALD':
+                            if ev_ts < 825000: # Si muere antes del 13:45 puede reaparecer
+                                global_herald_respawn = ev_ts + 360000
+                            if team in (100, 200):
+                                team_heralds[team].append({"timestamp": ev_ts, "minute": round(ev_ts / 60000, 1)})
+
+                    elif et == 'BUILDING_KILL':
+                        building = ev.get('buildingType')
+                        team     = ev.get('killerTeamId')
+                        victim_team = ev.get('teamId') # Quien pierde el edificio
+                        
+                        if building == 'TOWER_BUILDING':
+                            if team in (100, 200):
+                                team_towers[team].append({
+                                    "lane": ev.get('laneType', 'UNKNOWN'),
+                                    "tier": ev.get('towerType', 'UNKNOWN'),
+                                    "timestamp": ev_ts, "minute": round(ev_ts / 60000, 1),
+                                })
+                        elif building == 'INHIBITOR_BUILDING':
+                            lane = ev.get('laneType', 'UNKNOWN')
+                            if victim_team in (100, 200):
+                                inhibitor_respawns[f"{victim_team}_{lane}"] = ev_ts + 300000 # 5 min
+                            if team in (100, 200):
+                                team_inhibitors[team].append({
+                                    "lane": lane,
+                                    "timestamp": ev_ts, "minute": round(ev_ts / 60000, 1),
+                                })
+                    
+                    elif et == 'BUILDING_RESPAWN': # Si el inhibidor revive por Riot API explícitamente
+                        building = ev.get('buildingType')
+                        if building == 'INHIBITOR_BUILDING':
+                            lane = ev.get('laneType', 'UNKNOWN')
+                            revived_team = ev.get('teamId')
+                            key = f"{revived_team}_{lane}"
+                            if key in inhibitor_respawns:
+                                del inhibitor_respawns[key]
+
+            # ── Rellenar cada snapshot ──
+            prev_ms = -1
+            tf_state = {"active": False}
+            for snap in self.metadata_history:
+                ms        = snap['game_time_ms']
+                frame_idx = min(max(int(ms / 60000), 0), len(frames) - 1)
+                frame     = frames[frame_idx]
+                frame_ts  = frame.get('timestamp', frame_idx * 60000)
+                p_frames  = frame.get('participantFrames', {})
+
+                inv_at_ts = inventories.get(ms, {})
+                kda_at_ts       = self._get_kda_at(kda_history, ms)
+                kill_events_window = self._get_kill_events_in_window(kill_damage_log, prev_ms, ms)
+                tf_status       = self._detect_teamfight(frame, recent_deaths, frame_ts, tf_state)
+
+                timeline_pid_to_snap_id = {}
+                for p_data in snap['participants']:
+                    if p_data.get('puuid'):
+                        t_pid = puuid_to_pid.get(p_data['puuid'])
+                        if t_pid:
+                            timeline_pid_to_snap_id[t_pid] = p_data.get('participant_id')
+
+                for p_data in snap['participants']:
+                    puuid = p_data.get('puuid')
+                    if not puuid:
+                        continue
+                    pid = puuid_to_pid.get(puuid)
+                    if not pid:
+                        continue
+                    pf = p_frames.get(str(pid), {})
+                    if not pf:
+                        continue
+
+                    player_inv = inv_at_ts.get(pid, {"items": [], "trinket": STEALTH_WARD_ID})
+                    kda        = kda_at_ts.get(pid, {"kills": 0, "deaths": 0, "assists": 0})
+
+                    # Obtener vida actual
+                    health = pf.get('championStats', {}).get('health', 0)
+                    health_max = pf.get('championStats', {}).get('healthMax', 0)
+
+                    recent_death = None
+                    for d_ev in participant_death_history.get(pid, []):
+                        if d_ev["death_timestamp"] <= ms:
+                            recent_death = d_ev
+                        else:
+                            break
+
+                    is_dead = False
+                    respawn_remaining = 0
+
+                    if recent_death and ms < recent_death["respawn_time"]:
+                        is_dead = True
+                        respawn_remaining = max(0, round((recent_death["respawn_time"] - ms) / 1000, 1))
+                        # Forzamos la vida a 0 mientras el jugador esta verdaderamente muerto, 
+                        # ignorando la vida falsa proporcionada por Riot
+                        health = 0
+                    elif health == 0 and health_max > 0:
+                        is_dead = True
+
+                    # Mapear IDs de kills recientes para usar el participant_id del snapshot
+                    mapped_recent_kills = []
+                    for rk in kill_events_window.get(pid, []):
+                        mapped_assistants = []
+                        for asi in rk.get("assistants", []):
+                            mapped_assistants.append({
+                                "id": timeline_pid_to_snap_id.get(asi["id"], asi["id"]),
+                                "damage": asi.get("damage", 0)
+                            })
+                        mapped_recent_kills.append({
+                            "victim_id": timeline_pid_to_snap_id.get(rk["victim_id"], rk["victim_id"]),
+                            "damage_dealt": rk["damage_dealt"],
+                            "timestamp_ms": rk["timestamp_ms"],
+                            "assistants": mapped_assistants
+                        })
+
+                    p_data['stats'].update({
+                        "level":          pf.get('level', 0),
+                        "gold":           pf.get('totalGold', 0),
+                        "current_gold":   pf.get('currentGold', 0),
+                        "minions_killed": pf.get('minionsKilled', 0) + pf.get('jungleMinionsKilled', 0),
+                        "xp":             pf.get('xp', 0),
+                        "health":         health,
+                        "health_max":     health_max,
+                        "pos": {
+                            "x": pf.get('position', {}).get('x', 0),
+                            "y": pf.get('position', {}).get('y', 0),
+                        },
+                        # Kills recientes en este intervalo mapeadas a IDs reales
+                        "recent_kills": mapped_recent_kills,
+                        # Items del tracker lineal (todos los jugadores)
+                        "items":   player_inv["items"],
+                        "trinket": player_inv["trinket"],
+                        # KDA acumulativo
+                        "kills":   kda["kills"],
+                        "deaths":  kda["deaths"],
+                        "assists": kda["assists"],
+                        # Estado de muerte
+                        "is_dead":                 is_dead,
+                        "respawn_timer_remaining":  respawn_remaining,
+                        "in_teamfight": tf_status.get(pid - 1, False),
+                    })
+
+                snap['objectives'] = self._build_objectives(
+                    ms, frame_ts, team_dragons, team_barons, team_towers,
+                    team_inhibitors, team_heralds, global_dragon_respawn, global_baron_respawn, global_herald_respawn, inhibitor_respawns
+                )
+                snap['winning_team'] = winning_team
+                prev_ms = ms
+
+
+
+            # Volcado debug
+            if DUMP_SNAPSHOTS:
+                self._dump_debug()
+
+            self._validate()
+            log(f"\n✅ {len(self.metadata_history)} snapshots enriquecidos (v3.1)")
+            return True
+
+        except Exception as e:
+            log(f"❌ Error procesando Timeline: {e}", "ERROR")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    # ─────────────────────────────────────────
+    # Helpers internos
+    # ─────────────────────────────────────────
+
+    def _build_kda_history(self, frames: list) -> list:
+        running = {pid: {"kills": 0, "deaths": 0, "assists": 0} for pid in range(1, 11)}
+        # kill_damage_log: list of {timestamp, killer_id, victim_id, damage_dealt}
+        kill_damage_log = []
+        history = []
+        for frame in frames:
+            for ev in frame.get('events', []):
+                if ev.get('type') != 'CHAMPION_KILL':
+                    continue
+                ev_ts  = ev.get('timestamp', 0)
+                killer = ev.get('killerId')
+                victim = ev.get('victimId')
+                if killer and 1 <= killer <= 10:
+                    running[killer]["kills"] += 1
+                if victim and 1 <= victim <= 10:
+                    running[victim]["deaths"] += 1
+                for a in ev.get('assistingParticipantIds', []):
+                    if 1 <= a <= 10:
+                        running[a]["assists"] += 1
+
+                # Extraer daño que el killer y asistentes hicieron a la víctima
+                victim_dmg_received = ev.get('victimDamageReceived', [])
+                dmg_by_participant = {}
+                for d in victim_dmg_received:
+                    pid = d.get('participantId')
+                    if pid and 1 <= pid <= 10:
+                        dmg = d.get('magicDamage', 0) + d.get('physicalDamage', 0) + d.get('trueDamage', 0)
+                        dmg_by_participant[pid] = dmg_by_participant.get(pid, 0) + dmg
+
+                if killer and 1 <= killer <= 10:
+                    killer_dmg = dmg_by_participant.get(killer, 0)
+                    assists_data = []
+                    for a in ev.get('assistingParticipantIds', []):
+                        if 1 <= a <= 10:
+                            assists_data.append({"id": a, "damage": dmg_by_participant.get(a, 0)})
+
+                    kill_damage_log.append({
+                        "timestamp":    ev_ts,
+                        "killer_id":    killer,
+                        "victim_id":    victim,
+                        "damage_dealt": killer_dmg,
+                        "assistants":   assists_data
+                    })
+
+                history.append({
+                    "timestamp": ev_ts,
+                    "kda": {pid: dict(running[pid]) for pid in range(1, 11)},
+                })
+        return history, kill_damage_log
+
+    def _get_kda_at(self, kda_history: list, ts_ms: int) -> dict:
+        result = {pid: {"kills": 0, "deaths": 0, "assists": 0} for pid in range(1, 11)}
+        for entry in kda_history:
+            if entry["timestamp"] <= ts_ms:
+                result = entry["kda"]
+            else:
+                break
+        return result
+
+    def _get_kill_events_in_window(self, kill_damage_log: list, start_ms: int, end_ms: int) -> dict:
+        """Devuelve las kills (con asistentes y daño) donde el participantId fue el killer, en el intervalo dado."""
+        result = {pid: [] for pid in range(1, 11)}
+        for entry in kill_damage_log:
+            if start_ms < entry["timestamp"] <= end_ms:
+                pid = entry["killer_id"]
+                result[pid].append({
+                    "victim_id":    entry["victim_id"],
+                    "damage_dealt": entry["damage_dealt"],
+                    "assistants":   entry["assistants"],
+                    "timestamp_ms": entry["timestamp"],
+                })
+        return result
+
+    def _build_objectives(self, snap_ms, frame_ts, td, tb, tt, ti, th, d_respawn, b_respawn, h_respawn, inhib_respawns) -> dict:
+        def filt(lst, keys):
+            return [{k: x[k] for k in keys} for x in lst if x['timestamp'] <= frame_ts]
+            
+        def get_inhib_timers(team_id):
+            timers = {}
+            for lane in ["TOP_LANE", "MID_LANE", "BOT_LANE"]:
+                key = f"{team_id}_{lane}"
+                if key in inhib_respawns and inhib_respawns[key] > snap_ms:
+                    timers[lane] = round((inhib_respawns[key] - snap_ms) / 1000, 1)
+            return timers
+            
+        # El dragón base aparece al min 5.0 (300000ms), Baron al 20.0 (1200000ms), Heraldo al 8.0 (480000)
+        dragon_timer = 0
+        if d_respawn > snap_ms: dragon_timer = round((d_respawn - snap_ms) / 1000, 1)
+        elif snap_ms < 300000 and d_respawn == 0: dragon_timer = round((300000 - snap_ms) / 1000, 1)
+        
+        baron_timer = 0
+        if b_respawn > snap_ms: baron_timer = round((b_respawn - snap_ms) / 1000, 1)
+        elif snap_ms < 1200000 and b_respawn == 0: baron_timer = round((1200000 - snap_ms) / 1000, 1)
+        
+        herald_timer = 0
+        if h_respawn > snap_ms: herald_timer = round((h_respawn - snap_ms) / 1000, 1)
+        elif snap_ms < 480000 and h_respawn == 0: herald_timer = round((480000 - snap_ms) / 1000, 1)
+            
+        return {
+            "global_respawns_remaining_sec": {
+                "dragon": dragon_timer,
+                "baron_nashor": baron_timer,
+                "rift_herald": herald_timer,
+            },
+            "blue_team": {
+                "dragons":    filt(td[100], ["type", "minute"]),
+                "barons":     filt(tb[100], ["minute"]),
+                "towers":     filt(tt[100], ["lane", "tier", "minute"]),
+                "inhibitors": filt(ti[100], ["lane", "minute"]),
+                "heralds":    filt(th[100], ["minute"]),
+                "dead_inhibitors_respawn_sec": get_inhib_timers(100) # Team 100 es el perjudicado aquí
+            },
+            "red_team": {
+                "dragons":    filt(td[200], ["type", "minute"]),
+                "barons":     filt(tb[200], ["minute"]),
+                "towers":     filt(tt[200], ["lane", "tier", "minute"]),
+                "inhibitors": filt(ti[200], ["lane", "minute"]),
+                "heralds":    filt(th[200], ["minute"]),
+                "dead_inhibitors_respawn_sec": get_inhib_timers(200) # Team 200 es el perjudicado aquí
+            },
+        }
+
+    def _detect_teamfight(self, frame, recent_deaths, current_ts, tf_state) -> dict:
+        DISTANCE    = 3000
+        TF_TIMEOUT  = 20000  # 20 segundos
+        
+        pf = frame.get("participantFrames", {})
+        players = []
+        for pid_str, data in pf.items():
+            pid = int(pid_str)
+            pos = data.get("position", {"x": 0, "y": 0})
+            health = data.get("championStats", {}).get("health", 0)
+            is_dead = (health == 0)
+            players.append({"id": pid - 1, "pos": pos, "is_dead": is_dead, "team": 100 if pid <= 5 else 200})
+
+        # Última muerte global
+        past_deaths = [d["timestamp"] for d in recent_deaths if d["timestamp"] <= current_ts]
+        last_death_ts = max(past_deaths) if past_deaths else 0
+        time_since_death = current_ts - last_death_ts if last_death_ts > 0 else 9999999
+
+        alive_blue = [p for p in players if p["team"] == 100 and not p["is_dead"]]
+        alive_red  = [p for p in players if p["team"] == 200 and not p["is_dead"]]
+
+        survivors_near = False
+        for b in alive_blue:
+            for r in alive_red:
+                dist = ((b["pos"]["x"] - r["pos"]["x"])**2 + (b["pos"]["y"] - r["pos"]["y"])**2)**0.5
+                if dist <= DISTANCE:
+                    survivors_near = True
+                    break
+            if survivors_near:
+                break
+
+        if not tf_state["active"]:
+            has_recent_death = (time_since_death <= TF_TIMEOUT)
+            clump_found = False
+            for center_p in players:
+                blue_count = 0
+                red_count  = 0
+                for p in players:
+                    dist = ((center_p["pos"]["x"] - p["pos"]["x"])**2 + (center_p["pos"]["y"] - p["pos"]["y"])**2)**0.5
+                    if dist <= DISTANCE:
+                        if p["team"] == 100: blue_count += 1
+                        else: red_count += 1
+                if blue_count >= 4 and red_count >= 4:
+                    clump_found = True
+                    break
+            
+            if clump_found and has_recent_death:
+                tf_state["active"] = True
+        else:
+            if time_since_death > TF_TIMEOUT and not survivors_near:
+                tf_state["active"] = False
+
+        in_tf = {i: False for i in range(10)}
+        if tf_state["active"]:
+            for p in players:
+                if not p["is_dead"]:
+                    enemies = alive_red if p["team"] == 100 else alive_blue
+                    near_enemy = any(((p["pos"]["x"] - e["pos"]["x"])**2 + (p["pos"]["y"] - e["pos"]["y"])**2)**0.5 <= DISTANCE for e in enemies)
+                    if near_enemy:
+                        in_tf[p["id"]] = True
+                else:
+                    my_deaths = [d["timestamp"] for d in recent_deaths if d["victim_id"] == p["id"] and d["timestamp"] <= current_ts]
+                    if my_deaths and (current_ts - max(my_deaths) <= TF_TIMEOUT):
+                        in_tf[p["id"]] = True
+
+        return in_tf
+
+    def _calculate_death_timer(self, level, game_time_ms=0):
+        """
+        Calcula tiempo de respawn según nivel y tiempo de partida.
+        Fórmula actualizada Patch 14.16+ (Summoner's Rift).
+        Total Death Time = BRW + (BRW × TIFx)
+        """
+        import math
+        BRW_TABLE = {
+            1: 10, 2: 10, 3: 12, 4: 12, 5: 14, 6: 16,
+            7: 20, 8: 25, 9: 28, 10: 32.5, 11: 35,
+            12: 37.5, 13: 40, 14: 42.5, 15: 45,
+            16: 47.5, 17: 50, 18: 52.5
+        }
+        brw = BRW_TABLE.get(level, 52.5)
+        game_minutes = game_time_ms / 60000
+        if game_minutes < 15:
+            tifx = 0
+        elif game_minutes < 30:
+            tifx = math.ceil(2 * (game_minutes - 15)) * 0.425 / 100
+        elif game_minutes < 45:
+            tifx = (12.75 + math.ceil(2 * (game_minutes - 30)) * 0.30) / 100
+        elif game_minutes < 55:
+            tifx = (21.75 + math.ceil(2 * (game_minutes - 45)) * 1.45) / 100
+        else:
+            tifx = 0.50
+        tifx = min(tifx, 0.50)
+        return round(brw + (brw * tifx), 1)
+
+    def _validate(self):
+        if len(self.metadata_history) < 3:
+            return
+        log("\n   🔍 VALIDACIÓN (Jugador 1 y Jugador 6):")
+        checkpoints = [
+            self.metadata_history[0],
+            self.metadata_history[len(self.metadata_history) // 2],
+            self.metadata_history[-1],
+        ]
+        for snap in checkpoints:
+            for idx in [0, 5]:  # Jugador 1 (blue) y jugador 6 (red)
+                if idx < len(snap['participants']):
+                    p  = snap['participants'][idx]
+                    s  = p['stats']
+                    log(f"      @ {snap['game_time_min']:.1f}min P{idx+1} ({p['name'][:12]}): "
+                        f"items={s['items']} trinket={s['trinket']} "
+                        f"KDA={s['kills']}/{s['deaths']}/{s['assists']} gold={s['gold']}")
+
+    def _dump_debug(self):
+        try:
+            dump_path = os.path.join(self.recorder.temp_dir, "debug_snapshots.json")
+            with open(dump_path, 'w', encoding='utf-8') as f:
+                json.dump(self.metadata_history, f, ensure_ascii=False, indent=2)
+            log(f"   💾 Debug volcado: {dump_path}", "DEBUG")
+        except Exception as e:
+            log(f"   ⚠️ Error volcando debug: {e}", "DEBUG")
+
+    # ─────────────────────────────────────────
+    # Guardado de archivos finales
+    # ─────────────────────────────────────────
+
+    def save_final_reports(self):
+        if not self.metadata_history:
+            log("⚠️ Sin snapshots para guardar", "WARN")
+            return
+        log("\n💾 Generando archivos finales...")
+
+        # JSON completo
+        json_path = os.path.join(self.recorder.temp_dir, "ai_metadata_history.json")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(self.metadata_history, f, indent=2, ensure_ascii=False)
+        log(f"   ✅ JSON: {len(self.metadata_history)} snapshots")
+
+        # CSV para entrenamiento
+        csv_path = os.path.join(self.recorder.temp_dir, "ai_training_timeline.csv")
+        try:
+            with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+                w = csv.writer(f)
+                w.writerow([
+                    'ms', 'min', 'p_idx', 'team', 'champ', 'champ_name', 'role',
+                    'gold', 'current_gold', 'level', 'cs', 'xp',
+                    'health', 'health_max',
+                    'x', 'y',
+                    'kills', 'deaths', 'assists',
+                    'recent_kills',
+                    'is_dead', 'respawn_timer_remaining', 'in_teamfight',
+                    'items', 'trinket',
+                    'team_dragons', 'team_barons', 'team_towers',
+                    'team_inhibitors', 'team_heralds',
+                    'enemy_dragons', 'enemy_barons', 'enemy_towers',
+                    'enemy_inhibitors', 'enemy_heralds',
+                    'team_dragon_types', 'enemy_dragon_types',
+                    'team_tower_kills', 'enemy_tower_kills',
+                    'team_inhibitor_kills', 'enemy_inhibitor_kills',
+                    'winning_team'
+                ])
+                for snap in self.metadata_history:
+                    ms   = snap['game_time_ms']
+                    mins = snap['game_time_min']
+                    obj  = snap.get('objectives', {})
+                    blue = obj.get('blue_team', {})
+                    red  = obj.get('red_team', {})
+                    for idx, p in enumerate(snap['participants']):
+                        s     = p['stats']
+                        tid   = p['team_id']
+                        t_obj = blue if tid == 100 else red
+                        e_obj = red  if tid == 100 else blue
+                        items_str     = ','.join(str(i) for i in s.get('items', [])) or 'none'
+                        t_drag_types  = ','.join(d['type'] for d in t_obj.get('dragons', [])) or 'none'
+                        e_drag_types  = ','.join(d['type'] for d in e_obj.get('dragons', [])) or 'none'
+                        
+                        t_tower_types = ','.join(f"{d['tier']}_{d['lane']}" for d in t_obj.get('towers', [])) or 'none'
+                        e_tower_types = ','.join(f"{d['tier']}_{d['lane']}" for d in e_obj.get('towers', [])) or 'none'
+                        t_inhib_types = ','.join(d['lane'] for d in t_obj.get('inhibitors', [])) or 'none'
+                        e_inhib_types = ','.join(d['lane'] for d in e_obj.get('inhibitors', [])) or 'none'
+                        
+                        # Serializar recent_kills como string JSON
+                        recent_kills_str  = json.dumps(s.get('recent_kills', []), separators=(',', ':'))
+                        w.writerow([
+                            ms, mins, idx, tid, p['champion_id'], p.get('champion_name', ''), p.get('role', ''),
+                            s.get('gold', 0), s.get('current_gold', 0),
+                            s.get('level', 0), s.get('minions_killed', 0), s.get('xp', 0),
+                            s.get('health', 0), s.get('health_max', 0),
+                            s['pos']['x'], s['pos']['y'],
+                            s.get('kills', 0), s.get('deaths', 0), s.get('assists', 0),
+                            recent_kills_str,
+                            1 if s.get('is_dead') else 0,
+                            s.get('respawn_timer_remaining', 0),
+                            1 if s.get('in_teamfight') else 0,
+                            items_str, s.get('trinket', STEALTH_WARD_ID),
+                            len(t_obj.get('dragons', [])),    len(t_obj.get('barons', [])),
+                            len(t_obj.get('towers', [])),     len(t_obj.get('inhibitors', [])),
+                            len(t_obj.get('heralds', [])),
+                            len(e_obj.get('dragons', [])),    len(e_obj.get('barons', [])),
+                            len(e_obj.get('towers', [])),     len(e_obj.get('inhibitors', [])),
+                            len(e_obj.get('heralds', [])),
+                            t_drag_types, e_drag_types,
+                            t_tower_types, e_tower_types,
+                            t_inhib_types, e_inhib_types,
+                            snap.get('winning_team', 0)
+                        ])
+            duration = self.metadata_history[-1]['game_time_min']
+            log(f"   ✅ CSV: {len(self.metadata_history)*10} rows | "
+                f"{len(self.metadata_history)} snapshots | {duration:.1f}min")
+        except Exception as e:
+            log(f"❌ Error generando CSV: {e}", "ERROR")
+            import traceback
+            traceback.print_exc()
+
+
+# ══════════════════════════════════════════════════════════════
+# SPECTATOR RECORDER
+# ══════════════════════════════════════════════════════════════
+
+class SpectatorRecorder:
+    def __init__(self, game_id, encryption_key, platform_id=PLATFORM_ID,
+                 player_name="Unknown", extra_metadata=None, metadata_only=False):
+        self.game_id        = game_id
+        self.encryption_key = encryption_key
+        self.platform_id    = platform_id
+        self.player_name    = player_name
+        self.extra_metadata = extra_metadata or {}
+        self.metadata_only  = metadata_only
+
+        self.spectator_url = (
+            f"http://{SPECTATOR_SERVERS.get(platform_id, 'spectator.kr.lol.pvp.net:8080')}"
+        )
+
+        self.chunks    = {}
+        self.keyframes = {}
+        self.game_metadata = None
+
+        self.recording          = False
+        self.start_time         = None
+        self.end_time           = None
+        self.consecutive_errors = 0
+        self.total_chunks       = 0
+        self.total_keyframes    = 0
+        self.game_length_ms     = 0
+
+        self.start_game_chunk_id  = 1
+        self.end_startup_chunk_id = 0
+        self.keyframe_interval    = 60000
+
+        self.temp_dir = os.path.join(SAVE_PATH, f"temp_{game_id}")
+        os.makedirs(self.temp_dir, exist_ok=True)
+
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 RiotClient/12.0.0"})
+
+    def _spectator_request(self, method, params="", timeout=15):
+        global LAST_SPECTATOR_REQUEST
+        for attempt in range(4):
+            with GLOBAL_SPECTATOR_LOCK:
+                elapsed = time.time() - LAST_SPECTATOR_REQUEST
+                if elapsed < MIN_SPECTATOR_INTERVAL:
+                    time.sleep(MIN_SPECTATOR_INTERVAL - elapsed)
+                LAST_SPECTATOR_REQUEST = time.time()
+            url = (f"{self.spectator_url}/observer-mode/rest/consumer/{method}"
+                   f"/{self.platform_id}/{self.game_id}/{params}token")
+            try:
+                r = self.session.get(url, timeout=timeout)
+                if r.status_code == 429:
+                    wait = 5 * (attempt + 1)
+                    log(f"⚠️ 429 RateLimit. Esperando {wait}s...", "WARN")
+                    time.sleep(wait)
+                    continue
+                return r
+            except Exception:
+                if attempt == 0:
+                    alt = SPECTATOR_SERVERS_ALT.get(self.platform_id)
+                    if alt:
+                        self.spectator_url = f"http://{alt}"
+                        continue
+                time.sleep(2)
+        return None
+
+    def start_recording(self):
+        log(f"\n🔴 INICIANDO GRABACIÓN: {self.game_id} ({self.player_name})")
+        self.recording  = True
+        self.start_time = time.time()
+
+        # ── Metadata inicial: PRIMERO pedimos esto, LUEGO arrancamos el thread ──
+        # Es crítico tener game_metadata antes de que el collector empiece,
+        # porque _get_participants() lo necesita para obtener los 10 jugadores.
+        for attempt in range(5):
+            r_meta = self._spectator_request("getGameMetaData", "1/")
+            if r_meta and r_meta.status_code == 200:
+                self.game_metadata        = r_meta.json()
+                self.start_game_chunk_id  = self.game_metadata.get('startGameChunkId', 1)
+                self.end_startup_chunk_id = self.game_metadata.get('endStartupChunkId', 0)
+                self.keyframe_interval    = self.game_metadata.get('interestScore', 60000)
+                with open(os.path.join(self.temp_dir, "metadata.json"), 'w') as f:
+                    json.dump(self.game_metadata, f, indent=2)
+                n = len(self.game_metadata.get('participants', []))
+                log(f"   📋 Metadata inicial: {n} participants")
+                break
+            else:
+                log(f"   ⏳ Esperando metadata (intento {attempt+1}/5)...")
+                time.sleep(5)
+
+        # ── Lanzar thread de snapshots DESPUÉS de tener metadata ──
+        collector = MetadataCollector(self, interval=20)
+        collector.start()
+
+        last_chunk_reported = 0
+        try:
+            while self.recording:
+                r_info = self._spectator_request("getLastChunkInfo", "0/")
+                if not r_info or r_info.status_code != 200:
+                    self.consecutive_errors += 1
+                    if self.consecutive_errors > MAX_CONSECUTIVE_ERRORS:
+                        log("❌ Demasiados errores, abortando", "ERROR")
+                        break
+                    time.sleep(10)
+                    continue
+
+                self.consecutive_errors = 0
+                info     = r_info.json()
+                chunk_id = info.get('chunkId', 0)
+                kf_id    = info.get('keyFrameId', 0)
+                end_id   = info.get('endGameChunkId', 0)
+
+                if not self.metadata_only:
+                    # Chunks
+                    for cid in range(max(1, chunk_id - 5), chunk_id + 1):
+                        if cid not in self.chunks:
+                            r_c = self._spectator_request("getGameDataChunk", f"{cid}/")
+                            if r_c and r_c.status_code == 200:
+                                self.chunks[cid] = r_c.content
+                                with open(os.path.join(self.temp_dir, f"chunk_{cid}.bin"), 'wb') as fh:
+                                    fh.write(r_c.content)
+                                self.total_chunks += 1
+                    # Keyframes
+                    for kid in range(max(1, kf_id - 1), kf_id + 1):
+                        if kid not in self.keyframes:
+                            r_k = self._spectator_request("getKeyFrame", f"{kid}/")
+                            if r_k and r_k.status_code == 200:
+                                self.keyframes[kid] = r_k.content
+                                with open(os.path.join(self.temp_dir, f"kf_{kid}.bin"), 'wb') as fh:
+                                    fh.write(r_k.content)
+                                self.total_keyframes += 1
+
+                if chunk_id > last_chunk_reported:
+                    elapsed_min = (time.time() - self.start_time) / 60
+                    log(f"   📡 Chunk {chunk_id} | KF {kf_id} | {elapsed_min:.1f}min | "
+                        f"Snaps: {len(collector.metadata_history)}")
+                    last_chunk_reported = chunk_id
+
+                if end_id > 0 and chunk_id >= end_id:
+                    log(f"🏁 Partida terminada (Chunk {end_id})")
+                    break
+
+                # Sleep del chunk polling — NO afecta al thread de snapshots
+                sleep_s = min(info.get('nextAvailableChunk', 10000) / 1000, 20)
+                time.sleep(sleep_s)
+
+        finally:
+            collector.stop()
+
+        self.end_time       = time.time()
+        self.recording      = False
+        self.game_length_ms = int((self.end_time - self.start_time) * 1000)
+
+        log(f"\n{'='*65}")
+        log(f"📊 FASE DE ENRIQUECIMIENTO v3.1")
+        log(f"{'='*65}")
+        collector.enrich_with_timeline()
+        collector.save_final_reports()
+
+        log("✅ Grabación completada y archivos generados (No ROFL)")
+        return self.temp_dir
+
 
 # ══════════════════════════════════════════════════════════════
 # MODO MONITOR
@@ -1565,97 +1330,110 @@ def get_challenger_and_grandmaster_list():
 
 def record_game_thread(game_id, enc_key, name, full_info, metadata_only):
     global LAST_GAME_END_TIME
-    recorder = SpectatorRecorder(game_id, enc_key, player_name=name, extra_metadata=full_info, metadata_only=metadata_only)
+    recorder = SpectatorRecorder(game_id, enc_key, player_name=name,
+                                 extra_metadata=full_info, metadata_only=metadata_only)
     path = recorder.start_recording()
-    
     if path or metadata_only:
         completed_recordings.add(str(game_id))
         with open(STATE_FILE, 'w') as f:
             json.dump({"completed": list(completed_recordings)}, f)
-    
     if str(game_id) in active_recordings:
         del active_recordings[str(game_id)]
-    
     LAST_GAME_END_TIME = time.time()
-    log(f"❄️ Periodo de enfriamiento activado tras terminar Game {game_id}")
+    log(f"❄️ Enfriamiento activado tras Game {game_id}")
+
 
 def monitor_mode(metadata_only=False):
-    log("🚀 MODO MONITOR COREA (KR) ACTIVADO - v2.1 CORREGIDO")
+    log("🚀 MODO MONITOR KR — v3.1")
     global challenger_players, LAST_GAME_END_TIME
     challenger_players = get_challenger_and_grandmaster_list()
-    
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, 'r') as f:
                 completed_recordings.update(json.load(f).get('completed', []))
-        except:
+        except Exception:
             pass
 
     while True:
-        time_since_last = time.time() - LAST_GAME_END_TIME
-        if time_since_last < 120:
-            wait = int(120 - time_since_last)
-            log(f"❄️ Enfriando... {wait}s restantes", "DEBUG")
+        since_last = time.time() - LAST_GAME_END_TIME
+        if since_last < 120:
+            log(f"❄️ Enfriando... {int(120-since_last)}s", "DEBUG")
             time.sleep(20)
             continue
 
         for p in challenger_players:
             if len(active_recordings) >= 1:
                 break
-
             puuid = p.get('puuid')
             if not puuid:
                 continue
-            
             game = check_active_game(puuid)
-            if game:
-                game_id = str(game['gameId'])
-                if game_id not in completed_recordings and game_id not in active_recordings:
-                    if game.get('gameQueueConfigId') in [420, 440]:
-                        start = game.get('gameStartTime', 0)
-                        elapsed_sec = (time.time() * 1000 - start) / 1000
-                        
-                        if elapsed_sec < 300:
-                            real_name = get_summoner_name_from_puuid(puuid)
-                            log(f"\n🆕 NUEVA PARTIDA: {real_name} | Game {game_id}")
-                            
-                            active_recordings[game_id] = True
-                            t = threading.Thread(target=record_game_thread, args=(game_id, game['observers']['encryptionKey'], real_name, game, metadata_only))
-                            t.daemon = True
-                            t.start()
-                            
-                            log(f"🔒 Grabando (1 partida máxima)")
-                            time.sleep(5)
-                            break
-            time.sleep(0.5)
-            
+            if not game:
+                time.sleep(0.5)
+                continue
+            game_id = str(game['gameId'])
+            if game_id in completed_recordings or game_id in active_recordings:
+                continue
+            if game.get('gameQueueConfigId') not in (420, 440):
+                continue
+            elapsed_sec = (time.time() * 1000 - game.get('gameStartTime', 0)) / 1000
+            if elapsed_sec >= 300:
+                continue
+
+            real_name = get_summoner_name_from_puuid(puuid)
+            log(f"\n🆕 NUEVA PARTIDA: {real_name} | Game {game_id}")
+            active_recordings[game_id] = True
+            t = threading.Thread(
+                target=record_game_thread,
+                args=(game_id, game['observers']['encryptionKey'],
+                      real_name, game, metadata_only),
+                daemon=True,
+            )
+            t.start()
+            log("🔒 Grabando (máx 1 partida simultánea)")
+            time.sleep(5)
+            break
+
         log(f"😴 Activas: {len(active_recordings)}. Esperando {CHECK_INTERVAL}s...", "DEBUG")
         time.sleep(CHECK_INTERVAL)
 
+
+# ══════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════
+
 def main():
-    parser = argparse.ArgumentParser(description="LoL Replay Recorder PRO (IA + Replay) v2.1 CORREGIDO")
-    parser.add_argument('--puuid', type=str, help='PUUID para grabar partida específica')
-    parser.add_argument('--metadata-only', action='store_true', help='Solo extraer datos de IA, no bajar replay')
-    args = parser.parse_args()
-    
-    print("\n" + "═"*65)
-    print("   GRABADOR DE REPLAYS PRO v2.1 - SISTEMA HISTÓRICO CORREGIDO")
-    print("   ───────────────────────────────────────────────")
-    print(f"   Modo: {'METADATA ONLY' if args.metadata_only else 'REPLAY + METADATA'}")
-    print(f"   Intervalo: 20 segundos exactos (timing absoluto)")
-    print(f"   Fix: Items/KDA con snapshots históricos (no sobrescritura)")
-    print(f"   Región: {PLATFORM_ID}")
-    print("═"*65 + "\n")
-    
+    ap = argparse.ArgumentParser(description="LoL Replay Recorder v3.1")
+    ap.add_argument('--puuid',          type=str,           help='PUUID para partida específica')
+    ap.add_argument('--metadata-only',  action='store_true', help='Solo datos IA, sin .rofl')
+    ap.add_argument('--verbose',        action='store_true', help='Log DEBUG activado')
+    ap.add_argument('--dump-snapshots', action='store_true', help='Volcar snapshots a JSON para debug')
+    args = ap.parse_args()
+
+    global VERBOSE, DUMP_SNAPSHOTS
+    VERBOSE        = args.verbose
+    DUMP_SNAPSHOTS = args.dump_snapshots
+
+    print("\n" + "═" * 65)
+    print("   GRABADOR DE REPLAYS v3.1")
+    print("   ─────────────────────────────────────────────")
+    print(f"   Modo:      {'METADATA ONLY' if args.metadata_only else 'REPLAY + METADATA'}")
+    print(f"   Snapshots: cada 20s exactos (thread independiente)")
+    print(f"   Items:     10 jugadores, pasada lineal PURCHASED/SOLD/UNDO")
+    print(f"   Región:    {PLATFORM_ID}")
+    print("═" * 65 + "\n")
+
     if args.puuid:
         info = check_active_game(args.puuid)
         if info:
             name = get_summoner_name_from_puuid(args.puuid)
-            record_game_thread(info['gameId'], info['observers']['encryptionKey'], name, info, args.metadata_only)
+            record_game_thread(info['gameId'], info['observers']['encryptionKey'],
+                               name, info, args.metadata_only)
         else:
             print("❌ El jugador no está en partida.")
     else:
         monitor_mode(args.metadata_only)
+
 
 if __name__ == "__main__":
     try:
