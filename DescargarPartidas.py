@@ -31,7 +31,7 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 # CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════
 
-API_KEY         = os.getenv('RIOT_API_KEY', 'RGAPI-90f03e26-bd8f-477d-811f-d73adb7efec0')
+API_KEY         = os.getenv('RIOT_API_KEY', 'RGAPI-f3ed243c-dea4-4d4c-8302-52dd9105fa93')
 REGION_PLATFORM = "kr"
 REGION_ROUTING  = "asia"
 PLATFORM_ID     = "KR"
@@ -146,6 +146,20 @@ def get_champions_data():
         log(f"   ⚠️ Error al obtener datos de campeones DDragon: {e}", "DEBUG")
     return CHAMPIONS_DATA
 
+ITEMS_DATA = {}
+def get_items_data():
+    global ITEMS_DATA
+    if ITEMS_DATA: return ITEMS_DATA
+    try:
+        res = requests.get("https://ddragon.leagueoflegends.com/api/versions.json", timeout=5)
+        latest_version = res.json()[0]
+        res = requests.get(f"https://ddragon.leagueoflegends.com/cdn/{latest_version}/data/en_US/item.json", timeout=5)
+        ITEMS_DATA = res.json().get("data", {})
+        log(f"   📦 {len(ITEMS_DATA)} items cargados de DDragon ({latest_version})")
+    except Exception as e:
+        log(f"   ⚠️ Error al obtener datos de items DDragon: {e}", "DEBUG")
+    return ITEMS_DATA
+
 def get_match_info(game_id: int):
     match_id = f"{PLATFORM_ID}_{game_id}"
     url      = f"https://{REGION_ROUTING}.api.riotgames.com/lol/match/v5/matches/{match_id}"
@@ -210,14 +224,14 @@ def get_challenger_and_grandmaster_list():
 
 def extract_item_events(timeline: dict) -> list:
     """
-    Extrae ITEM_PURCHASED / ITEM_SOLD / ITEM_UNDO del Timeline,
+    Extrae ITEM_PURCHASED / ITEM_SOLD / ITEM_DESTROYED / ITEM_UNDO del Timeline,
     ordenados por timestamp.
     """
     events = []
     for frame in timeline.get("info", {}).get("frames", []):
         for ev in frame.get("events", []):
             t = ev.get("type", "")
-            if t in ("ITEM_PURCHASED", "ITEM_SOLD", "ITEM_UNDO"):
+            if t in ("ITEM_PURCHASED", "ITEM_SOLD", "ITEM_DESTROYED", "ITEM_UNDO"):
                 events.append({
                     "timestamp":     ev.get("timestamp", 0),
                     "participantId": ev.get("participantId"),
@@ -226,10 +240,11 @@ def extract_item_events(timeline: dict) -> list:
                     "beforeId":      ev.get("beforeId"),
                 })
     events.sort(key=lambda e: e["timestamp"])
-    bought = sum(1 for e in events if e["type"] == "ITEM_PURCHASED")
-    sold   = sum(1 for e in events if e["type"] == "ITEM_SOLD")
-    undos  = sum(1 for e in events if e["type"] == "ITEM_UNDO")
-    log(f"   📦 Eventos items: PURCHASED={bought} SOLD={sold} UNDO={undos}")
+    bought    = sum(1 for e in events if e["type"] == "ITEM_PURCHASED")
+    sold      = sum(1 for e in events if e["type"] == "ITEM_SOLD")
+    destroyed = sum(1 for e in events if e["type"] == "ITEM_DESTROYED")
+    undos     = sum(1 for e in events if e["type"] == "ITEM_UNDO")
+    log(f"   📦 Eventos items: PURCHASED={bought} SOLD={sold} DESTROYED={destroyed} UNDO={undos}")
     return events
 
 
@@ -267,11 +282,17 @@ def build_inventories(item_events: list, snapshot_timestamps_ms: list) -> dict:
             if ev["type"] == "ITEM_PURCHASED":
                 if item_id in TRINKETS:
                     inv["trinket"] = item_id
-                elif item_id not in inv["items"] and len(inv["items"]) < 6:
+                elif len(inv["items"]) < 6:
                     inv["items"].append(item_id)
 
             elif ev["type"] == "ITEM_SOLD":
                 if item_id in inv["items"]:
+                    inv["items"].remove(item_id)
+
+            elif ev["type"] == "ITEM_DESTROYED":
+                if item_id in TRINKETS:
+                    pass  # Los trinkets destruidos se manejan con PURCHASED del nuevo
+                elif item_id in inv["items"]:
                     inv["items"].remove(item_id)
 
             elif ev["type"] == "ITEM_UNDO":
@@ -454,12 +475,14 @@ class MetadataCollector:
 
             for idx, p in enumerate(participants):
                 puuid = p.get('puuid') or ''
+                team_id = p.get('teamId', 0)
                 p_data = {
                     "participant_id": p.get('participantId', idx + 1),
                     "puuid":          puuid,
                     "name":           p.get('summonerName') or p.get('riotId', 'Unknown'),
                     "champion_id":    p.get('championId', 0),
-                    "team_id":        p.get('teamId', 0),
+                    "team_id":        team_id,
+                    "team_color":     "Blue" if team_id == 100 else "Red" if team_id == 200 else str(team_id),
                     "stats": {
                         "level": 0, "gold": 0, "current_gold": 0,
                         "minions_killed": 0, "xp": 0,
@@ -769,10 +792,27 @@ class MetadataCollector:
                             "assistants": mapped_assistants
                         })
 
+                    # Calcular gold_spent sumando coste de items del inventario
+                    items_db = get_items_data()
+                    gold_spent = 0
+                    items_detailed = []
+                    for iid in player_inv["items"]:
+                        item_info = items_db.get(str(iid), {})
+                        item_name = item_info.get("name", f"Item_{iid}")
+                        item_cost = item_info.get("gold", {}).get("total", 0)
+                        gold_spent += item_cost
+                        items_detailed.append(f"[{iid}] |{item_name}")
+
+                    trinket_id = player_inv["trinket"]
+                    trinket_info = items_db.get(str(trinket_id), {})
+                    trinket_name = trinket_info.get("name", f"Item_{trinket_id}")
+                    trinket_detailed = f"[{trinket_id}] |{trinket_name}"
+
                     p_data['stats'].update({
                         "level":          pf.get('level', 0),
                         "gold":           pf.get('totalGold', 0),
                         "current_gold":   pf.get('currentGold', 0),
+                        "gold_spent":     gold_spent,
                         "minions_killed": pf.get('minionsKilled', 0) + pf.get('jungleMinionsKilled', 0),
                         "xp":             pf.get('xp', 0),
                         "health":         health,
@@ -784,8 +824,10 @@ class MetadataCollector:
                         # Kills recientes en este intervalo mapeadas a IDs reales
                         "recent_kills": mapped_recent_kills,
                         # Items del tracker lineal (todos los jugadores)
-                        "items":   player_inv["items"],
-                        "trinket": player_inv["trinket"],
+                        "items":          player_inv["items"],
+                        "items_detailed": items_detailed,
+                        "trinket":         player_inv["trinket"],
+                        "trinket_detailed": trinket_detailed,
                         # KDA acumulativo
                         "kills":   kda["kills"],
                         "deaths":  kda["deaths"],
@@ -801,6 +843,24 @@ class MetadataCollector:
                     team_inhibitors, team_heralds, global_dragon_respawn, global_baron_respawn, global_herald_respawn, inhibitor_respawns
                 )
                 snap['winning_team'] = winning_team
+
+                # Team gold totals y diferencia
+                blue_gold = sum(p['stats'].get('gold', 0) for p in snap['participants'] if p['team_id'] == 100)
+                red_gold  = sum(p['stats'].get('gold', 0) for p in snap['participants'] if p['team_id'] == 200)
+                diff = blue_gold - red_gold
+                if diff > 0:
+                    diff_label = f"Blue +{diff}"
+                elif diff < 0:
+                    diff_label = f"Red +{abs(diff)}"
+                else:
+                    diff_label = "Even"
+                snap['team_gold'] = {
+                    "blue_total": blue_gold,
+                    "red_total":  red_gold,
+                    "gold_diff":  diff,
+                    "gold_diff_label": diff_label,
+                }
+
                 prev_ms = ms
 
 
@@ -905,24 +965,24 @@ class MetadataCollector:
             for lane in ["TOP_LANE", "MID_LANE", "BOT_LANE"]:
                 key = f"{team_id}_{lane}"
                 if key in inhib_respawns and inhib_respawns[key] > snap_ms:
-                    timers[lane] = round((inhib_respawns[key] - snap_ms) / 1000, 1)
+                    timers[lane] = round((inhib_respawns[key] - snap_ms) / 60000, 2)
             return timers
             
         # El dragón base aparece al min 5.0 (300000ms), Baron al 20.0 (1200000ms), Heraldo al 8.0 (480000)
         dragon_timer = 0
-        if d_respawn > snap_ms: dragon_timer = round((d_respawn - snap_ms) / 1000, 1)
-        elif snap_ms < 300000 and d_respawn == 0: dragon_timer = round((300000 - snap_ms) / 1000, 1)
+        if d_respawn > snap_ms: dragon_timer = round((d_respawn - snap_ms) / 60000, 2)
+        elif snap_ms < 300000 and d_respawn == 0: dragon_timer = round((300000 - snap_ms) / 60000, 2)
         
         baron_timer = 0
-        if b_respawn > snap_ms: baron_timer = round((b_respawn - snap_ms) / 1000, 1)
-        elif snap_ms < 1200000 and b_respawn == 0: baron_timer = round((1200000 - snap_ms) / 1000, 1)
+        if b_respawn > snap_ms: baron_timer = round((b_respawn - snap_ms) / 60000, 2)
+        elif snap_ms < 1200000 and b_respawn == 0: baron_timer = round((1200000 - snap_ms) / 60000, 2)
         
         herald_timer = 0
-        if h_respawn > snap_ms: herald_timer = round((h_respawn - snap_ms) / 1000, 1)
-        elif snap_ms < 480000 and h_respawn == 0: herald_timer = round((480000 - snap_ms) / 1000, 1)
+        if h_respawn > snap_ms: herald_timer = round((h_respawn - snap_ms) / 60000, 2)
+        elif snap_ms < 480000 and h_respawn == 0: herald_timer = round((480000 - snap_ms) / 60000, 2)
             
         return {
-            "global_respawns_remaining_sec": {
+            "global_respawns_remaining_min": {
                 "dragon": dragon_timer,
                 "baron_nashor": baron_timer,
                 "rift_herald": herald_timer,
@@ -933,7 +993,7 @@ class MetadataCollector:
                 "towers":     filt(tt[100], ["lane", "tier", "minute"]),
                 "inhibitors": filt(ti[100], ["lane", "minute"]),
                 "heralds":    filt(th[100], ["minute"]),
-                "dead_inhibitors_respawn_sec": get_inhib_timers(100) # Team 100 es el perjudicado aquí
+                "dead_inhibitors_respawn_min": get_inhib_timers(100)
             },
             "red_team": {
                 "dragons":    filt(td[200], ["type", "minute"]),
@@ -941,7 +1001,7 @@ class MetadataCollector:
                 "towers":     filt(tt[200], ["lane", "tier", "minute"]),
                 "inhibitors": filt(ti[200], ["lane", "minute"]),
                 "heralds":    filt(th[200], ["minute"]),
-                "dead_inhibitors_respawn_sec": get_inhib_timers(200) # Team 200 es el perjudicado aquí
+                "dead_inhibitors_respawn_min": get_inhib_timers(200)
             },
         }
 
@@ -1090,13 +1150,14 @@ class MetadataCollector:
                 w = csv.writer(f)
                 w.writerow([
                     'ms', 'min', 'p_idx', 'team', 'champ', 'champ_name', 'role',
-                    'gold', 'current_gold', 'level', 'cs', 'xp',
+                    'gold', 'current_gold', 'gold_spent', 'level', 'cs', 'xp',
                     'health', 'health_max',
                     'x', 'y',
                     'kills', 'deaths', 'assists',
                     'recent_kills',
                     'is_dead', 'respawn_timer_remaining', 'in_teamfight',
-                    'items', 'trinket',
+                    'items', 'items_detailed', 'trinket', 'trinket_detailed',
+                    'team_gold_total', 'gold_diff',
                     'team_dragons', 'team_barons', 'team_towers',
                     'team_inhibitors', 'team_heralds',
                     'enemy_dragons', 'enemy_barons', 'enemy_towers',
@@ -1112,12 +1173,14 @@ class MetadataCollector:
                     obj  = snap.get('objectives', {})
                     blue = obj.get('blue_team', {})
                     red  = obj.get('red_team', {})
+                    tg   = snap.get('team_gold', {})
                     for idx, p in enumerate(snap['participants']):
                         s     = p['stats']
                         tid   = p['team_id']
                         t_obj = blue if tid == 100 else red
                         e_obj = red  if tid == 100 else blue
                         items_str     = ','.join(str(i) for i in s.get('items', [])) or 'none'
+                        items_det_str = ' | '.join(s.get('items_detailed', [])) or 'none'
                         t_drag_types  = ','.join(d['type'] for d in t_obj.get('dragons', [])) or 'none'
                         e_drag_types  = ','.join(d['type'] for d in e_obj.get('dragons', [])) or 'none'
                         
@@ -1126,11 +1189,15 @@ class MetadataCollector:
                         t_inhib_types = ','.join(d['lane'] for d in t_obj.get('inhibitors', [])) or 'none'
                         e_inhib_types = ','.join(d['lane'] for d in e_obj.get('inhibitors', [])) or 'none'
                         
+                        # Team gold según equipo
+                        my_team_gold  = tg.get('blue_total', 0) if tid == 100 else tg.get('red_total', 0)
+                        my_gold_diff  = tg.get('gold_diff', 0) if tid == 100 else -tg.get('gold_diff', 0)
+                        
                         # Serializar recent_kills como string JSON
                         recent_kills_str  = json.dumps(s.get('recent_kills', []), separators=(',', ':'))
                         w.writerow([
                             ms, mins, idx, tid, p['champion_id'], p.get('champion_name', ''), p.get('role', ''),
-                            s.get('gold', 0), s.get('current_gold', 0),
+                            s.get('gold', 0), s.get('current_gold', 0), s.get('gold_spent', 0),
                             s.get('level', 0), s.get('minions_killed', 0), s.get('xp', 0),
                             s.get('health', 0), s.get('health_max', 0),
                             s['pos']['x'], s['pos']['y'],
@@ -1139,7 +1206,9 @@ class MetadataCollector:
                             1 if s.get('is_dead') else 0,
                             s.get('respawn_timer_remaining', 0),
                             1 if s.get('in_teamfight') else 0,
-                            items_str, s.get('trinket', STEALTH_WARD_ID),
+                            items_str, items_det_str,
+                            s.get('trinket', STEALTH_WARD_ID), s.get('trinket_detailed', ''),
+                            my_team_gold, my_gold_diff,
                             len(t_obj.get('dragons', [])),    len(t_obj.get('barons', [])),
                             len(t_obj.get('towers', [])),     len(t_obj.get('inhibitors', [])),
                             len(t_obj.get('heralds', [])),
