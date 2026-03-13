@@ -577,15 +577,34 @@ class MetadataCollector:
             pid_to_puuid = {p['participantId']: p['puuid']  for p in tl_parts if isinstance(p, dict)}
             log(f"   🔗 {len(puuid_to_pid)} PUUIDs mapeados desde Timeline")
 
+            # ── Detectar PUUIDs duplicados (jugadores con nombre oculto) ──
+            # Cuando hay PUUIDs duplicados, mapeamos por posición (participant_id)
+            puuid_counts = {}
+            for p_data_check in (self.metadata_history[0]['participants'] if self.metadata_history else []):
+                pu = p_data_check.get('puuid', '')
+                if pu:
+                    puuid_counts[pu] = puuid_counts.get(pu, 0) + 1
+            duplicated_puuids = {pu for pu, count in puuid_counts.items() if count > 1}
+            if duplicated_puuids:
+                log(f"   ⚠️ {len(duplicated_puuids)} PUUIDs duplicados detectados, usando mapeo por participant_id")
+
             # ── Corregir PUUIDs faltantes en snapshots usando el Timeline ──
+            all_champ_names = set(champs_db.values())  # Para detectar nombres ocultos
             for snap in self.metadata_history:
                 for p_data in snap['participants']:
-                    if not p_data['puuid']:
-                        pid = p_data['participant_id']
-                        if pid in pid_to_puuid:
-                            p_data['puuid'] = pid_to_puuid[pid]
-                            
+                    snap_pid = p_data.get('participant_id', 0)
                     puuid = p_data.get('puuid', '')
+
+                    # Si el PUUID está duplicado, asignar el PUUID correcto del Timeline por posición
+                    if puuid in duplicated_puuids:
+                        correct_puuid = pid_to_puuid.get(snap_pid, '')
+                        if correct_puuid:
+                            p_data['puuid'] = correct_puuid
+                            puuid = correct_puuid
+                    elif not puuid and snap_pid in pid_to_puuid:
+                        p_data['puuid'] = pid_to_puuid[snap_pid]
+                        puuid = p_data['puuid']
+                    
                     c_id  = p_data.get('champion_id', 0)
                     
                     c_name = puuid_to_champname.get(puuid)
@@ -594,6 +613,11 @@ class MetadataCollector:
                         
                     p_data['champion_name'] = c_name
                     p_data['role'] = puuid_to_role.get(puuid, "")
+
+                    # Usar champion_name como nombre si el nombre actual parece ser un champion
+                    current_name = p_data.get('name', 'Unknown')
+                    if current_name in all_champ_names or current_name == 'Unknown':
+                        p_data['name'] = c_name
 
             # ── Sincronizar timestamps ──
             # El Timeline empieza cuando los jugadores salen de la base (t≈0).
@@ -741,9 +765,14 @@ class MetadataCollector:
 
                 for p_data in snap['participants']:
                     puuid = p_data.get('puuid')
-                    if not puuid:
-                        continue
-                    pid = puuid_to_pid.get(puuid)
+                    snap_pid = p_data.get('participant_id', 0)
+
+                    # Determinar el timeline pid: por PUUID si es único, por participant_id si está duplicado
+                    if puuid and puuid not in duplicated_puuids:
+                        pid = puuid_to_pid.get(puuid)
+                    else:
+                        pid = snap_pid  # Mapeo directo por posición
+
                     if not pid:
                         continue
                     pf = p_frames.get(str(pid), {})
