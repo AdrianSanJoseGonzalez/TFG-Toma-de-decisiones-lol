@@ -140,9 +140,15 @@ class ReplayExtractor:
         self.lcu_port = None
         self.lcu_token = None
         self.lcu_headers = None
-        self.riot_api_key = os.getenv('RIOT_API_KEY', 'RGAPI-c69b048f-c19f-4530-a6f7-768dbd43513e')
-        
+        self.riot_api_key = os.getenv('RIOT_API_KEY', 'RGAPI-02d50cba-5f08-44a6-9233-a119face5ced')
         self._load_lcu_credentials()
+        
+        # Carga del catálogo de items de OP.GG / DDragon para extraer nombres de las botas
+        try:
+            res_dd = requests.get("https://ddragon.leagueoflegends.com/cdn/15.21.1/data/en_US/item.json", timeout=10)
+            self.dd_items = res_dd.json().get("data", {})
+        except Exception:
+            self.dd_items = {}
 
     def _load_lcu_credentials(self):
         if not self.lockfile_path.exists():
@@ -194,6 +200,79 @@ class ReplayExtractor:
             res = requests.post(url, headers=self.lcu_headers, json={}, verify=False)
             return res.status_code in (200, 204)
         except: return False
+
+    def obtener_equipo_ganador(self, match_id_full: str):
+        """Retorna cuál equipo ha ganado la partida (100 para Azul, 200 para Rojo)."""
+        url_match = f"https://{get_routing_value(match_id_full.split('_')[0])}.api.riotgames.com/lol/match/v5/matches/{match_id_full}"
+        try:
+            res = requests.get(url_match, headers={"X-Riot-Token": self.riot_api_key}, timeout=10)
+            if res.status_code != 200:
+                return None
+                
+            match_data = res.json()
+            teams = match_data.get("info", {}).get("teams", [])
+            for t in teams:
+                if t.get("win"):
+                    return t["teamId"]
+            return None
+        except Exception:
+            return None
+
+    def obtener_role_bound_items(self, match_id_full: str):
+        """Retorna el item ligado al rol (botas de la S15) para cada campeón."""
+        url_match = f"https://{get_routing_value(match_id_full.split('_')[0])}.api.riotgames.com/lol/match/v5/matches/{match_id_full}"
+        try:
+            print(f"[DEBUG] Solicitando RoleBoundItems a Riot: {url_match}")
+            res = requests.get(url_match, headers={"X-Riot-Token": self.riot_api_key}, timeout=10)
+            print(f"    [DEBUG] Status Code: {res.status_code}")
+            
+            if res.status_code != 200:
+                print(f"    [DEBUG] Error en API: {res.text}")
+                return {}
+                
+            match_data = res.json()
+            botas_dict = {}
+            for p in match_data.get("info", {}).get("participants", []):
+                champ = p.get("championName", "").lower()
+                bota = p.get("roleBoundItem")
+                if bota:
+                    botas_dict[champ] = bota
+            
+            print(f"    [DEBUG] Diccionario de botas creado: {botas_dict}")
+            return botas_dict
+        except Exception as e:
+            print(f"    [DEBUG] Excepción en obtener_role_bound_items: {e}")
+            return {}
+
+    def obtener_tiempos_mision_botas(self, match_id_full: str):
+        """Encuentra exactamente en qué segundo el ADC completó la misión evolutiva de S15.
+           Lo detecta cuando se destruye el item 1001 (Tier 1) y/o el item base (ej: 1202)."""
+        routing = get_routing_value(match_id_full.split('_')[0])
+        url_timeline = f"https://{routing}.api.riotgames.com/lol/match/v5/matches/{match_id_full}/timeline"
+        url_match = f"https://{routing}.api.riotgames.com/lol/match/v5/matches/{match_id_full}"
+        try:
+            headers = {"X-Riot-Token": self.riot_api_key}
+            res_m = requests.get(url_match, headers=headers, timeout=10)
+            if res_m.status_code != 200: return {}
+            p_map = {}
+            for p in res_m.json().get("info", {}).get("participants", []):
+                p_map[p["participantId"]] = p.get("championName", "").lower()
+
+            res_t = requests.get(url_timeline, headers=headers, timeout=10)
+            if res_t.status_code != 200: return {}
+            
+            tiempos_mision = {}
+            for frame in res_t.json().get("info", {}).get("frames", []):
+                for e in frame.get("events", []):
+                    # El roleBoundItem 'consume' las botas T1 (1001) para darnos las mejoradas
+                    if e.get("type") == "ITEM_DESTROYED" and e.get("itemId") in [1001, 1202, 1203]:
+                        pid = e.get("participantId")
+                        champ = p_map.get(pid, "")
+                        if champ:
+                            tiempos_mision[champ] = e.get("timestamp", 0) / 1000.0
+            return tiempos_mision
+        except Exception:
+            return {}
 
     def wait_for_game_launch(self, timeout_secs=120):
         start_time = time.time()
@@ -269,8 +348,9 @@ class ReplayExtractor:
         except Exception as e:
             print(f"[ERROR] No se pudo guardar JSON: {e}")
 
-    def extract_game_data(self, output_file: str, sample_interval: float = 10.0, timeline_events: list = None):
+    def extract_game_data(self, output_file: str, sample_interval: float = 10.0, timeline_events: list = None, equipo_ganador=None, botas_dict=None, botas_tiempos=None):
         if timeline_events is None: timeline_events = []
+        if botas_tiempos is None: botas_tiempos = {}
         data_snapshots = []
         is_game_ended = False
         current_playback_time = 0.0
@@ -361,11 +441,81 @@ class ReplayExtractor:
                             is_game_ended = True
                             break
                     
+                    if botas_dict is None:
+                        botas_dict = {}
+                        
+                    # 5. Inyectar botas faltantes (RoleBoundItem) y calcular Oro Dinámico
+                    botas_ids = {1001, 3006, 3047, 3111, 3158, 3020, 3117, 3009, 3115}
+                    oro_equipo_azul = 0
+                    oro_equipo_rojo = 0
+                    oro_por_persona = {}
+                    
+                    for p in all_players:
+                        # ===== PARTE A: INYECTAR BOTAS =====
+                        items = p.get("items", [])
+                        current_item_ids = [item.get("itemID") for item in items]
+                        # Comprobar si tiene alguna bota de la lista tradicional
+                        tiene_botas = any(b_id in current_item_ids for b_id in botas_ids)
+                        
+                        # Solo inyectamos para los ADC (BOTTOM) si han completado la misión
+                        if not tiene_botas and p.get("position") == "BOTTOM":
+                            champ_name = p.get("championName", "").lower()
+                            raw_name = p.get("rawChampionName", "").split("_")[-1].lower()
+                            
+                            bota_real_id = botas_dict.get(champ_name) or botas_dict.get(raw_name)
+                            tiempo_completado = botas_tiempos.get(champ_name) or botas_tiempos.get(raw_name, 0)
+                            
+                            # Solo inyectar si el tiempo de replay actual >= al momento en que terminaron la quest
+                            if bota_real_id and (current_playback_time >= tiempo_completado or tiempo_completado == 0):
+                                dd_info = self.dd_items.get(str(bota_real_id), {})
+                                bota_falsa = {
+                                    "canUse": False,
+                                    "consumable": False,
+                                    "count": 1,
+                                    "displayName": dd_info.get("name", "RoleBound Boots"),
+                                    "itemID": bota_real_id,
+                                    "price": dd_info.get("gold", {}).get("total", 0),
+                                    "rawDescription": f"game_item_description_{bota_real_id}",
+                                    "rawDisplayName": f"game_item_displayname_{bota_real_id}",
+                                    "slot": 7
+                                }
+                                items.append(bota_falsa)
+                                p["items"] = items
+                                print(f"    [INFO] Bota {bota_real_id} inyectada para {champ_name}")
+                                
+                        # ===== PARTE B: CALCULAR ORO DINÁMICO =====
+                        oro_jugador = sum(item.get("price", 0) for item in p.get("items", []))
+                        
+                        # Inyectar `gold` directamente dentro de `scores`
+                        if "scores" not in p:
+                            p["scores"] = {}
+                        p["scores"]["gold"] = oro_jugador
+                        
+                        team = p.get("team", "")
+                        if team == "ORDER":
+                            oro_equipo_azul += oro_jugador
+                        elif team == "CHAOS":
+                            oro_equipo_rojo += oro_jugador
+
+                    # Cálculo de ventaja a nivel de Snapshot (padre)
+                    diff_oro = abs(oro_equipo_azul - oro_equipo_rojo)
+                    if oro_equipo_azul > oro_equipo_rojo:
+                        equipo_ventaja = "ORDER (Azul)"
+                    elif oro_equipo_rojo > oro_equipo_azul:
+                        equipo_ventaja = "CHAOS (Rojo)"
+                    else:
+                        equipo_ventaja = "EMPATE"
+
                     data_snapshots.append({
                         "game_time": current_playback_time,
+                        "diferencia_oro": diff_oro,
+                        "equipo_ventaja": equipo_ventaja,
+                        "oro_equipo_azul": oro_equipo_azul,
+                        "oro_equipo_rojo": oro_equipo_rojo,
                         "all_players": all_players,
                         "events": events_list + [e for e in timeline_events if e.get("EventTime", 0) <= current_playback_time],
-                        "game_data": game_data.get("gameData")
+                        "game_data": game_data.get("gameData"),
+                        "equipo_ganador": equipo_ganador
                     })
                     
                     # GUARDADO PROGRESIVO cada 10 snapshots
@@ -403,9 +553,24 @@ def process_batch(replays_dir: str, output_dir: str):
             continue
 
         cloud_timeline = extractor.get_match_timeline(rofl_file)
+        
+        # Obtener los datos extra de oro y victoria
+        match_id_str = f"{Path(rofl_file).stem.split('_')[0].upper()}_{Path(rofl_file).stem.split('-')[-1].split('_')[0]}" 
+        # Formato EUW1-1234567_01 o EUW1_1234567. Reparamos parseo para match_id
+        match_re = re.search(r'([A-Za-z0-9]+)[_-](\d{8,})', Path(rofl_file).stem)
+        if match_re:
+            match_id_full = f"{match_re.group(1).upper()}_{match_re.group(2)}"
+            ganador = extractor.obtener_equipo_ganador(match_id_full)
+            botas_dict = extractor.obtener_role_bound_items(match_id_full)
+            botas_tiempos = extractor.obtener_tiempos_mision_botas(match_id_full)
+        else:
+            ganador = None
+            botas_dict = None
+            botas_tiempos = None
+        
         if extractor.watch_replay(rofl_file):
             if extractor.wait_for_game_launch(timeout_secs=120):
-                extractor.extract_game_data(str(json_salida), sample_interval=10.0, timeline_events=cloud_timeline)
+                extractor.extract_game_data(str(json_salida), sample_interval=10.0, timeline_events=cloud_timeline, equipo_ganador=ganador, botas_dict=botas_dict, botas_tiempos=botas_tiempos)
                 
                 # Cerrar el proceso
                 os.system("taskkill /F /IM \"League of Legends.exe\" >nul 2>&1")
