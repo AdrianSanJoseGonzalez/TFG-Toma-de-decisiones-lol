@@ -101,7 +101,10 @@ def scroll_mouse(clicks):
         ctypes.windll.user32.SendInput(1, ctypes.pointer(x), ctypes.sizeof(x))
         time.sleep(0.03)
 
-MAX_ZOOM_SCROLLS = 30  # Número de scrolls para llegar al zoom máximo
+# CAMERA_Y_FIXED: altura fija que se fuerza por API para eliminar la variabilidad del zoom.
+# El mapa de LoL tiene ~180 unidades de altura de terreno como máximo.
+# Con Y=200 la cámara queda prácticamente encima del personaje, minimizando el offset X/Z.
+CAMERA_Y_FIXED = 200.0
 
 def focus_league_window():
     user32 = ctypes.windll.user32
@@ -143,11 +146,15 @@ class ReplayExtractor:
         self.riot_api_key = os.getenv('RIOT_API_KEY', 'RGAPI-02d50cba-5f08-44a6-9233-a119face5ced')
         self._load_lcu_credentials()
         
-        # Carga del catálogo de items de OP.GG / DDragon para extraer nombres de las botas
+        # Carga dinámica de la última versión de Data Dragon para asegurar precios actualizados
         try:
-            res_dd = requests.get("https://ddragon.leagueoflegends.com/cdn/15.21.1/data/en_US/item.json", timeout=10)
+            versions = requests.get("https://ddragon.leagueoflegends.com/api/versions.json", timeout=10).json()
+            latest_version = versions[0]
+            print(f"[INFO] Cargando items de la versión {latest_version}...")
+            res_dd = requests.get(f"https://ddragon.leagueoflegends.com/cdn/{latest_version}/data/en_US/item.json", timeout=10)
             self.dd_items = res_dd.json().get("data", {})
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] Error al cargar Data Dragon: {e}. Usando fallback de API.")
             self.dd_items = {}
 
     def _load_lcu_credentials(self):
@@ -274,6 +281,56 @@ class ReplayExtractor:
         except Exception:
             return {}
 
+    def get_champion_position(self, key_char: str, bounce_key: str) -> dict:
+        """
+        Salta al campeón objetivo via teclado, luego fuerza la Y de la cámara
+        a un valor fijo via POST /replay/render para anular la variabilidad del zoom.
+        """
+        # 1. Rebote: desancla la cámara del campeón anterior
+        tap_key(bounce_key, double=True)
+        time.sleep(0.2)
+
+        # 2. Saltar al campeón objetivo
+        tap_key(key_char, double=True)
+        time.sleep(0.3)
+
+        # 3. Leer posición actual (Punto inicial)
+        try:
+            res = requests.get(f"{self.replay_api_url}/replay/render", verify=False, timeout=2)
+            if res.status_code != 200:
+                return {"error": f"GET render falló: {res.status_code}"}
+            cam = res.json().get("cameraPosition", {})
+            x = cam.get("x", 0.0)
+            z = cam.get("z", 0.0)
+        except Exception as e:
+            return {"error": str(e)}
+
+        # 4. FORZAR Y FIJA vía POST: Esto es lo que alinea las coordenadas con el suelo 2D.
+        try:
+            requests.post(
+                f"{self.replay_api_url}/replay/render",
+                json={"cameraPosition": {"x": x, "y": CAMERA_Y_FIXED, "z": z}},
+                verify=False,
+                timeout=2
+            )
+            time.sleep(0.15) 
+        except Exception:
+            pass
+
+        # 5. Lectura final con altura normalizada
+        try:
+            res2 = requests.get(f"{self.replay_api_url}/replay/render", verify=False, timeout=2)
+            if res2.status_code == 200:
+                cam2 = res2.json().get("cameraPosition", {})
+                return {
+                    "x": cam2.get("x", x),
+                    "z": cam2.get("z", z)
+                }
+        except Exception:
+            pass
+
+        return {"x": x, "z": z}
+
     def wait_for_game_launch(self, timeout_secs=120):
         start_time = time.time()
         print("[INFO] Esperando respuesta de la Replay API (2999)...")
@@ -385,12 +442,7 @@ class ReplayExtractor:
                     game_data = res_all.json()
                     all_players = game_data.get("allPlayers", [])
 
-                    # 3. ZOOM IN una sola vez al inicio del snapshot
-                    scroll_mouse(MAX_ZOOM_SCROLLS)
-                    time.sleep(0.5)
-
-                    # 4. CICLO DE CÁMARA (ROTACIÓN)
-                    # Separar por equipo para asignar teclas correctamente
+                    # 3. CICLO DE CÁMARA (ROTACIÓN)
                     BLUE_KEYS = ['1', '2', '3', '4', '5']
                     RED_KEYS  = ['q', 'w', 'e', 'r', 't']
                     blue_idx, red_idx = 0, 0
@@ -400,12 +452,10 @@ class ReplayExtractor:
                         champ = p.get("championName", "?")
                         if team == "ORDER" and blue_idx < len(BLUE_KEYS):
                             key_char = BLUE_KEYS[blue_idx]
-                            # Top azul rebota a ADC rojo (bot), resto rebota a Top rojo
                             bounce_key = 'r' if blue_idx == 0 else 'q'
                             blue_idx += 1
                         elif team == "CHAOS" and red_idx < len(RED_KEYS):
                             key_char = RED_KEYS[red_idx]
-                            # Top rojo rebota a ADC azul (bot), resto rebota a Top azul
                             bounce_key = '4' if red_idx == 0 else '1'
                             red_idx += 1
                         else:
@@ -413,25 +463,10 @@ class ReplayExtractor:
                             p["position_exact"] = {"error": f"team '{team}' desconocido"}
                             continue
                         
-                        # REBOTE: Mover cámara al equipo opuesto para romper el "pegado"
-                        tap_key(bounce_key, double=True)
-                        time.sleep(0.3)
-                        
-                        # Ahora enganchar al campeón objetivo
-                        tap_key(key_char, double=True)
-                        time.sleep(0.5)
-                        
                         print(f"    [{team}] {champ} -> tecla '{key_char}'")
                         
-                        # Capturar posición
-                        try:
-                            res_render = requests.get(f"{self.replay_api_url}/replay/render", verify=False, timeout=2)
-                            if res_render.status_code == 200:
-                                p["position_exact"] = res_render.json().get("cameraPosition", {})
-                            else:
-                                p["position_exact"] = {"error": f"API Fail {res_render.status_code}"}
-                        except Exception as e:
-                            p["position_exact"] = {"error": str(e)}
+                        # Capturar posición con técnica de altura fija (Calibración Paradox)
+                        p["position_exact"] = self.get_champion_position(key_char, bounce_key)
 
 
                     # 4. Check Final y Snapshot
@@ -483,10 +518,18 @@ class ReplayExtractor:
                                 p["items"] = items
                                 print(f"    [INFO] Bota {bota_real_id} inyectada para {champ_name}")
                                 
-                        # ===== PARTE B: CALCULAR ORO DINÁMICO =====
-                        oro_jugador = sum(item.get("price", 0) for item in p.get("items", []))
+                        # ===== PARTE B: CALCULAR ORO DINÁMICO (Sincronizando Precios con Data Dragon) =====
+                        oro_jugador = 0
+                        for item in p.get("items", []):
+                            i_id = str(item.get("itemID", 0))
+                            if i_id in self.dd_items:
+                                # Sobrescribimos el precio en el objeto para que el JSON sea correcto
+                                real_total = self.dd_items[i_id].get("gold", {}).get("total", 0)
+                                item["price"] = real_total
+                                oro_jugador += real_total
+                            else:
+                                oro_jugador += item.get("price", 0)
                         
-                        # Inyectar `gold` directamente dentro de `scores`
                         if "scores" not in p:
                             p["scores"] = {}
                         p["scores"]["gold"] = oro_jugador
