@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Creador de Zonas LoL</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            background-color: #1a1a1a;
+            color: #eee;
+            margin: 20px;
+            display: flex;
+            gap: 20px;
+        }
+
+        .left-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .right-panel {
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        #map-container {
+            position: relative;
+            width: 512px;
+            height: 512px;
+            border: 2px solid #555;
+            cursor: crosshair;
+        }
+
+        #map-bg {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 512px;
+            height: 512px;
+            pointer-events: none;
+        }
+
+        #map-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 10;
+        }
+
+        .controls {
+            background-color: #2a2a2a;
+            padding: 15px;
+            border-radius: 8px;
+        }
+
+        input,
+        button {
+            padding: 8px;
+            margin: 5px 0;
+            background: #333;
+            color: white;
+            border: 1px solid #555;
+            border-radius: 4px;
+        }
+
+        button:hover {
+            background: #444;
+            cursor: pointer;
+        }
+
+        button.primary {
+            background: #0066cc;
+        }
+
+        button.primary:hover {
+            background: #0055aa;
+        }
+
+        textarea {
+            width: 100%;
+            height: 300px;
+            background: #222;
+            color: #0f0;
+            font-family: monospace;
+            border: 1px solid #444;
+            padding: 10px;
+        }
+
+        .zone-list {
+            margin-top: 10px;
+            font-size: 0.9em;
+            color: #aaa;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="left-panel">
+        <div id="map-container" style="width: 600px; height: 600px;">
+            <div id="map-bg-container"
+                style="position: absolute; top: 0; left: 0; width: 600px; height: 600px; pointer-events: none;">
+                <img src="map11_2026_orthogonal.jpg"
+                    style="width: 100%; height: 100%; object-fit: contain; background-color: #000; filter: brightness(1.2) contrast(1.1);"
+                    alt="Mapa SR ORTOGONAL 2026">
+            </div>
+            <canvas id="map-canvas" width="600" height="600"></canvas>
+        </div>
+
+        <div class="controls">
+            <p style="margin-top:0;"><strong>Instrucciones:</strong></p>
+            <ol style="margin-left:-20px; margin-bottom:10px; font-size:14px;">
+                <li>Escribe un nombre para la zona (ej. "Mid2R").</li>
+                <li>Haz clic en el mapa para dibujar los vértices del polígono (al menos 3).</li>
+                <li>Clica "Guardar Zona" para cerrar el polígono y registrarla.</li>
+                <li>Repite para todas tus zonas.</li>
+                <li>Genera el código Python abajo.</li>
+            </ol>
+
+            <label for="zoneName">Nombre de la Zona actual:</label><br>
+            <input type="text" id="zoneName" placeholder="Ej: JunglaTop" value="NuevaZona">
+
+            <br>
+            <button onclick="clearCurrentPolygon()">Deshacer puntos actuales</button>
+            <button class="primary" onclick="saveZone()">Guardar Zona</button>
+
+            <div class="zone-list" id="zoneList">Zonas guardadas: NINGUNA</div>
+
+            <hr style="margin-top:20px; border-color:#555;">
+            <p style="margin:5px 0;"><strong>Calibración del mapa (Sprite Ortogonal 2D):</strong></p>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 5px; font-size: 13px;">
+                <div><label>Min X:</label><br><input type="number" id="minX" value="-120" oninput="updateCalibration()"
+                        style="width:80px; padding:4px;"></div>
+                <div><label>Max X:</label><br><input type="number" id="maxX" value="14870" oninput="updateCalibration()"
+                        style="width:80px; padding:4px;"></div>
+                <div><label>Min Y:</label><br><input type="number" id="minY" value="-120" oninput="updateCalibration()"
+                        style="width:80px; padding:4px;"></div>
+                <div><label>Max Y:</label><br><input type="number" id="maxY" value="14980" oninput="updateCalibration()"
+                        style="width:80px; padding:4px;"></div>
+            </div>
+            <button class="primary" onclick="updateCalibration()" style="width:100%; margin-top:5px;">Actualizar Calibración</button>
+            <button onclick="resetCalibration()" style="width:100%; margin-top:5px; font-size:12px;">Restaurar Default Sprite</button>
+
+            <hr style="margin-top:20px; border-color:#555;">
+            <p style="margin:5px 0;"><strong>Localizador de Puntos (Normalización):</strong></p>
+            <div style="font-size: 11px; margin-bottom: 5px; color: #ffcc00;">* Si usas coordenadas extraídas con ZOOM MAX, activa el corrector.</div>
+            <div style="display: flex; gap: 5px; align-items: center; margin-bottom: 5px;">
+                <input type="checkbox" id="normalizeCamera" checked> 
+                <label for="normalizeCamera" style="font-size: 12px; color: #ccffff; cursor:pointer;">Corregir Zoom Cámara (Factor Paradox)</label>
+            </div>
+            <div style="display: flex; gap: 5px;">
+                <input type="number" id="manualX" placeholder="Pos X" style="width: 45%;">
+                <input type="number" id="manualY" placeholder="Pos Y" style="width: 45%;">
+            </div>
+            <button class="primary" onclick="showManualPoint()" style="width:100%;">Mostrar Punto</button>
+            <button onclick="clearManualPoints()" style="width:100%; font-size:12px;">Limpiar Puntos Manuales</button>
+        </div>
+    </div>
+
+    <div class="right-panel">
+        <div class="controls">
+            <button class="primary" style="width:100%" onclick="generatePython()">Generar Código Python</button>
+            <textarea id="pythonCode" readonly style="height: 500px;" placeholder="El diccionario en Python aparecerá aquí..."></textarea>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('map-canvas');
+        const ctx = canvas.getContext('2d');
+
+        let currentPoints = [];
+        let zones = {}; 
+
+        // CALIBRACIÓN PARA SPRITE CUADRADO ORTOGONAL
+        let MIN_X = -120;
+        let MAX_X = 14870;
+        let MIN_Y = -120;
+        let MAX_Y = 14980;
+
+        let DIV_X = MAX_X - MIN_X;
+        let DIV_Y = MAX_Y - MIN_Y;
+
+        function updateCalibration() {
+            MIN_X = parseFloat(document.getElementById('minX').value);
+            MAX_X = parseFloat(document.getElementById('maxX').value);
+            MIN_Y = parseFloat(document.getElementById('minY').value);
+            MAX_Y = parseFloat(document.getElementById('maxY').value);
+            DIV_X = MAX_X - MIN_X;
+            DIV_Y = MAX_Y - MIN_Y;
+            drawAll();
+        }
+
+        function resetCalibration() {
+            document.getElementById('minX').value = -120;
+            document.getElementById('maxX').value = 14870;
+            document.getElementById('minY').value = -120;
+            document.getElementById('maxY').value = 14980;
+            updateCalibration();
+        }
+
+        function canvasToGame(cx, cy) {
+            let x_game = MIN_X + (cx / 600) * DIV_X;
+            let y_game = MIN_Y + ((600 - cy) / 600) * DIV_Y;
+            return { x: Math.round(x_game), y: Math.round(y_game) };
+        }
+
+        function gameToCanvas(gx, gy) {
+            let cx = ((gx - MIN_X) / DIV_X) * 600;
+            let cy = 600 - (((gy - MIN_Y) / DIV_Y) * 600);
+            return { x: cx, y: cy };
+        }
+
+        /**
+         * FÓRMULA DE NORMALIZACIÓN PARADOX (Deducción PFG 2026)
+         * Mapea coordenadas de cámara (squashed cameraPosition) a World Space real.
+         * Basado en anclas estacionarias (Fuentes y Nexos).
+         */
+        function normalizeCameraCoords(x, y) {
+            // Constantes derivadas de la distorsión del viewport LoL a Max Zoom
+            const AX = 1.8501202;
+            const BX = -8032.8;
+            const AY = 1.8807339;
+            const BY = -8318.5;
+
+            return {
+                x: Math.round(x * AX + BX),
+                y: Math.round(y * AY + BY)
+            };
+        }
+
+        // Datos de referencia: Torres (Season 14+ Ground Truth / 2026 Update)
+        const referenceTowers = [
+            // EQUIPO AZUL (ORDER)
+            { team: "blue", name: "Top Outer", x: 1050, y: 10800 },
+            { team: "blue", name: "Top Inner", x: 1550, y: 7200 },
+            { team: "blue", name: "Top Inhib", x: 1160, y: 4287 },
+            { team: "blue", name: "Mid Outer", x: 5846, y: 6396 },
+            { team: "blue", name: "Mid Inner", x: 5050, y: 4800 },
+            { team: "blue", name: "Mid Inhib", x: 3650, y: 3650 },
+            { team: "blue", name: "Bot Outer", x: 11200, y: 1100 },
+            { team: "blue", name: "Bot Inner", x: 7400, y: 1450 },
+            { team: "blue", name: "Bot Inhib", x: 4280, y: 1250 },
+            { team: "blue", name: "Nexus L", x: 1800, y: 2250 },
+            { team: "blue", name: "Nexus R", x: 2250, y: 1800 },
+
+            // EQUIPO ROJO (CHAOS)
+            { team: "red", name: "Top Outer", x: 4200, y: 14000 },
+            { team: "red", name: "Top Inner", x: 7600, y: 13550 },
+            { team: "red", name: "Top Inhib", x: 10480, y: 13650 },
+            { team: "red", name: "Mid Outer", x: 8955, y: 8510 },
+            { team: "red", name: "Mid Inner", x: 9950, y: 10200 },
+            { team: "red", name: "Mid Inhib", x: 11350, y: 11350 },
+            { team: "red", name: "Bot Outer", x: 13950, y: 4100 },
+            { team: "red", name: "Bot Inner", x: 13450, y: 7800 },
+            { team: "red", name: "Bot Inhib", x: 13600, y: 10570 },
+            { team: "red", name: "Nexus L", x: 13200, y: 12750 },
+            { team: "red", name: "Nexus R", x: 12750, y: 13200 }
+        ];
+
+        canvas.addEventListener('mousedown', function (e) {
+            const rect = canvas.getBoundingClientRect();
+            const cx = e.clientX - rect.left;
+            const cy = e.clientY - rect.top;
+
+            currentPoints.push({ cx: cx, cy: cy });
+            drawAll();
+        });
+
+        function clearCurrentPolygon() {
+            currentPoints = [];
+            drawAll();
+        }
+
+        function saveZone() {
+            const nameInput = document.getElementById('zoneName');
+            let name = nameInput.value.trim();
+            if (!name) name = "Zona_Sin_Nombre_" + Object.keys(zones).length;
+
+            if (currentPoints.length < 3) {
+                alert("Un polígono necesita al menos 3 puntos.");
+                return;
+            }
+
+            // Convertir puntos a coords del juego y guardar
+            let gamePolygon = currentPoints.map(p => canvasToGame(p.cx, p.cy));
+            zones[name] = gamePolygon;
+
+            // Resetear para la siguiente zona
+            currentPoints = [];
+            nameInput.value = "";
+
+            updateZoneList();
+            drawAll();
+        }
+
+        function drawAll() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Dibujar torres de referencia
+            referenceTowers.forEach(t => {
+                let cp = gameToCanvas(t.x, t.y);
+                ctx.beginPath();
+                ctx.arc(cp.x, cp.y, 4, 0, Math.PI * 2);
+                ctx.fillStyle = t.team === 'blue' ? '#3399ff' : '#ff3333';
+                ctx.fill();
+                ctx.strokeStyle = 'white';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+
+                // Texto sutil con el nombre de la torre
+                // ctx.fillStyle = 'rgba(255, 255, 255, 0.4)';
+                // ctx.font = '8px sans-serif';
+                // ctx.fillText(t.name, cp.x + 5, cp.y + 3);
+            });
+
+            // Dibujar zonas guardadas
+            ctx.lineWidth = 2;
+            for (let name in zones) {
+                let poly = zones[name];
+                ctx.beginPath();
+                for (let i = 0; i < poly.length; i++) {
+                    let cp = gameToCanvas(poly[i].x, poly[i].y);
+                    if (i === 0) ctx.moveTo(cp.x, cp.y);
+                    else ctx.lineTo(cp.x, cp.y);
+                }
+                ctx.closePath();
+                ctx.fillStyle = 'rgba(0, 255, 0, 0.2)';
+                ctx.fill();
+                ctx.strokeStyle = 'rgba(0, 255, 0, 0.8)';
+                ctx.stroke();
+
+                // Poner nombre en el centro (aproximado)
+                let c_centerX = poly.reduce((sum, p) => sum + gameToCanvas(p.x, p.y).x, 0) / poly.length;
+                let c_centerY = poly.reduce((sum, p) => sum + gameToCanvas(p.x, p.y).y, 0) / poly.length;
+                ctx.fillStyle = 'white';
+                ctx.font = '12px sans-serif';
+                ctx.fillText(name, c_centerX - 15, c_centerY);
+            }
+
+            // Dibujar polígono actual siendo creado
+            if (currentPoints.length > 0) {
+                ctx.beginPath();
+                ctx.moveTo(currentPoints[0].cx, currentPoints[0].cy);
+                for (let i = 1; i < currentPoints.length; i++) {
+                    ctx.lineTo(currentPoints[i].cx, currentPoints[i].cy);
+                }
+                ctx.strokeStyle = '#fff';
+                ctx.setLineDash([5, 5]);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Dibujar puntos
+                currentPoints.forEach(p => {
+                    ctx.beginPath();
+                    ctx.arc(p.cx, p.cy, 4, 0, Math.PI * 2);
+                    ctx.fillStyle = 'lime';
+                    ctx.fill();
+                });
+            }
+
+            // Dibujar Puntos Manuales (X, Y directos)
+            manualPoints.forEach(p => {
+                let cp = gameToCanvas(p.gx, p.gy);
+                // Marcador tipo cruz o punto brillante
+                ctx.beginPath();
+                ctx.arc(cp.x, cp.y, 6, 0, Math.PI * 2);
+                ctx.fillStyle = '#ffcc00'; // Dorado/Amarillo
+                ctx.fill();
+                ctx.strokeStyle = 'black';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+
+                // Etiqueta de coordenadas
+                ctx.fillStyle = 'white';
+                ctx.font = 'bold 10px sans-serif';
+                ctx.fillText(`(${p.gx}, ${p.gy})`, cp.x + 8, cp.y + 3);
+            });
+        }
+
+        let manualPoints = [];
+
+        function showManualPoint() {
+            let gx = parseFloat(document.getElementById('manualX').value);
+            let gy = parseFloat(document.getElementById('manualY').value);
+
+            if (isNaN(gx) || isNaN(gy)) {
+                alert("Introduce coordenadas X e Y válidas.");
+                return;
+            }
+
+            // APLICAR NORMALIZACIÓN SI ESTÁ ACTIVADA
+            if (document.getElementById('normalizeCamera').checked) {
+                const norm = normalizeCameraCoords(gx, gy);
+                console.log(`Punto Original Cámara: (${gx}, ${gy}) -> Corregido a Suelo: (${norm.x}, ${norm.y})`);
+                gx = norm.x;
+                gy = norm.y;
+            }
+
+            manualPoints.push({ gx, gy });
+            drawAll();
+        }
+
+        function clearManualPoints() {
+            manualPoints = [];
+            drawAll();
+        }
+
+        // Llamar a drawAll una vez al inicio para mostrar las torres
+        drawAll();
+
+        function updateZoneList() {
+            let names = Object.keys(zones);
+            let s = names.length > 0 ? names.join(", ") : "NINGUNA";
+            document.getElementById('zoneList').innerText = "Zonas guardadas: " + s;
+        }
+
+        function generatePython() {
+            if (Object.keys(zones).length === 0) {
+                alert("No hay zonas para generar.");
+                return;
+            }
+
+            let code = "ZONAS_MAPA = {\n";
+            for (let name in zones) {
+                let coordsText = zones[name].map(p => `(${p.x}, ${p.y})`).join(", ");
+                code += `    "${name}": [${coordsText}],\n`;
+            }
+            code += "}\n\n";
+
+            code += `def punto_en_poligono(x, y, poligono):
+    n = len(poligono)
+    dentro = False
+    p1x, p1y = poligono[0]
+    for i in range(1, n + 1):
+        p2x, p2y = poligono[i % n]
+        if y > min(p1y, p2y):
+            if y <= max(p1y, p2y):
+                if x <= max(p1x, p2x):
+                    if p1y != p2y:
+                        xints = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                    if p1x == p2x or x <= xints:
+                        dentro = not dentro
+        p1x, p1y = p2x, p2y
+    return dentro
+
+def obtener_zona(x, y):
+    for nombre_zona, poligono in ZONAS_MAPA.items():
+        if punto_en_poligono(x, y, poligono):
+            return nombre_zona
+    return "Desconocida"  # O "Jungla" u otro nombre genérico
+`;
+
+            document.getElementById('pythonCode').value = code;
+        }
+    </script>
+</body>
+
+</html>
