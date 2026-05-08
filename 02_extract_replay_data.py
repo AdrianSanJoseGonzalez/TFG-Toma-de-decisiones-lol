@@ -178,7 +178,7 @@ class ReplayExtractor:
         self.lcu_port = None
         self.lcu_token = None
         self.lcu_headers = None
-        self.riot_api_key = os.getenv('RIOT_API_KEY', 'RGAPI-965c9ba1-10d3-45bf-ba2a-95362f1d183b')
+        self.riot_api_key = os.getenv('RIOT_API_KEY', 'RGAPI-af4c2d3e-90e7-42a9-9263-e94b43497674')
         self._load_lcu_credentials()
         self.hud_reader = HUDReader() if HUDReader else None
         
