@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../../Downloads/dataset"
+		},
+		{
+			"path": "../../../Downloads/digit_templates"
+		},
+		{
+			"path": "../../../Downloads/_assets"
+		},
+		{
+			"path": "../../../.gemini/antigravity/scratch/lol_replay_downloader/ml_dataset"
+		}
+	],
+	"settings": {}
+}
