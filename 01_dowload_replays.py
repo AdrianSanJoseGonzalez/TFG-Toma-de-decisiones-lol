@@ -1,8 +1,3 @@
-"""
-Requisitos:
-    pip install requests watchdog
-"""
-
 import os
 import sys
 import time
@@ -35,7 +30,7 @@ POLL_INTERVAL    = 2
 REGION_PREFIX    = "EUW1"
 
 # ── Riot API (Modo Monitor EUW) ───────────────────────────────────────────────
-API_KEY          = os.getenv('RIOT_API_KEY', 'RGAPI-ee95891e-0e6b-428f-84e3-3f23290ffd61')
+API_KEY          = os.getenv('RIOT_API_KEY', 'RGAPI-950d1cfb-cf16-4985-8bb8-802f3965100e')
 REGION_PLATFORM  = "euw1"
 REGION_ROUTING   = "europe"
 PLATFORM_ID      = "EUW1"
@@ -43,14 +38,12 @@ PLATFORM_ID      = "EUW1"
 STATE_FILE       = "recorder_state.json"
 CHECK_INTERVAL   = 120
 AUTO_STATE_FILE  = "auto_download_state.json"
-AUTO_CHECK_INTERVAL = 180                    # segundos entre chequeos de nuevas partidas
-MAX_MATCHES_PER_PLAYER = 5                   # últimas N partidas por jugador
-TOP_PLAYERS_COUNT      = 100                 # cuántos GM cargar (los top N GM)
+AUTO_CHECK_INTERVAL = 180                   
+MAX_MATCHES_PER_PLAYER = 5                   
+TOP_PLAYERS_COUNT      = 100                
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # 1. LCU — conexión
-# ══════════════════════════════════════════════════════════════════════════════
 
 def find_lockfile() -> Path:
     candidates = [
@@ -80,7 +73,6 @@ def parse_lockfile(lockfile: Path) -> dict:
 
 
 def get_lcu_session() -> tuple:
-    """Devuelve (base_url, auth) listos para usar con requests."""
     lf   = find_lockfile()
     data = parse_lockfile(lf)
     base_url = f"https://127.0.0.1:{data['port']}"
@@ -89,15 +81,10 @@ def get_lcu_session() -> tuple:
     return base_url, auth
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. LCU — historial de partidas (fuente automática de IDs propios)
-# ══════════════════════════════════════════════════════════════════════════════
 
+# 2. LCU — historial de partidas 
 def get_match_history(count: int = 20) -> list:
-    """
-    Obtiene las últimas `count` partidas del historial via LCU.
-    No necesita Riot API key — usa el cliente directamente.
-    """
+   
     base_url, auth = get_lcu_session()
 
     # PUUID del jugador logueado
@@ -138,7 +125,6 @@ def get_match_history(count: int = 20) -> list:
         duration = g.get("gameDuration", 0)
         ts       = g.get("gameCreation", 0)
 
-        # Resultado: el primer participante siempre es el jugador local
         participants = g.get("participants", [])
         result = "?"
         if participants:
@@ -158,13 +144,11 @@ def get_match_history(count: int = 20) -> list:
 
 
 def get_recent_match_ids(count: int = 20) -> list:
-    """Devuelve solo los match_ids. Útil para scripts externos."""
     return [g["match_id"] for g in get_match_history(count)]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+
 # 3. LCU — descarga del replay
-# ══════════════════════════════════════════════════════════════════════════════
 
 def normalize_match_id(raw: str) -> str:
     if "_" in raw:
@@ -216,9 +200,7 @@ def get_download_status(match_id: str) -> str:
     return "unknown"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # 4. Watcher — detectar el .rofl en disco
-# ══════════════════════════════════════════════════════════════════════════════
 
 class RoflHandler(FileSystemEventHandler):
     def __init__(self, expected_id: str):
@@ -230,7 +212,7 @@ class RoflHandler(FileSystemEventHandler):
     def on_created(self, event):
         if not event.is_directory and self.pattern.search(event.src_path):
             self.found_path = Path(event.src_path)
-            log.info("✅ Archivo detectado: %s", self.found_path.name)
+            log.info(" Archivo detectado: %s", self.found_path.name)
 
     def on_modified(self, event):
         self.on_created(event)
@@ -268,17 +250,11 @@ def wait_for_rofl(match_id: str, timeout: int = DOWNLOAD_TIMEOUT) -> Path:
     )
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+
 # 5. Pipeline principal — importable desde el recorder
-# ══════════════════════════════════════════════════════════════════════════════
 
 def download_and_wait(raw_match_id) -> Path:
-    """
-    Usado por el recorder al terminar una partida:
-        from rofl_downloader import download_and_wait
-        rofl_path = download_and_wait(game_id)           # int o str
-        rofl_path = download_and_wait("EUW1_7123456789") # con prefijo
-    """
+   
     match_id = normalize_match_id(str(raw_match_id))
     request_download(match_id)
 
@@ -298,42 +274,39 @@ def download_and_wait(raw_match_id) -> Path:
     return wait_for_rofl(match_id)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+
 # 6. Riot API — helpers para modo automático
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _riot_api_call(url: str, retries: int = 3) -> requests.Response | None:
-    """Llama a la Riot API con reintentos y manejo de rate-limit."""
     headers = {"X-Riot-Token": API_KEY}
     for attempt in range(retries):
         try:
             r = requests.get(url, headers=headers, timeout=10)
             if r.status_code == 200:
                 return r
-            elif r.status_code == 429:  # Rate limited
+            elif r.status_code == 429:  
                 retry_after = int(r.headers.get("Retry-After", 5))
-                log.warning("⏳ Rate limited, esperando %ds...", retry_after)
+                log.warning("Rate limited, esperando %ds...", retry_after)
                 time.sleep(retry_after)
                 continue
             elif r.status_code == 403:
-                log.error("🔑 API Key inválida o expirada (403).")
+                log.error("API Key inválida o expirada (403).")
                 return r
             else:
-                log.warning("⚠️ Riot API %d en %s (intento %d/%d)",
+                log.warning("Riot API %d en %s (intento %d/%d)",
                             r.status_code, url[:80], attempt + 1, retries)
                 if attempt < retries - 1:
                     time.sleep(2)
                 return r
         except requests.exceptions.RequestException as e:
-            log.warning("⚠️ Request error: %s (intento %d/%d)", e, attempt + 1, retries)
+            log.warning("Request error: %s (intento %d/%d)", e, attempt + 1, retries)
             if attempt < retries - 1:
                 time.sleep(2)
     return None
 
 
 def get_top_players_euw() -> list:
-    """Obtiene Challenger + Grandmaster de EUW."""
-    log.info("🏆 Cargando Top jugadores EUW (Challenger + GM)...")
+    log.info("Cargando Top jugadores EUW (Challenger + GM)...")
     players = []
     headers = {"X-Riot-Token": API_KEY}
     
@@ -342,7 +315,7 @@ def get_top_players_euw() -> list:
     r_c = requests.get(url_c, headers=headers)
     if r_c.status_code == 200:
         players.extend(r_c.json().get('entries', []))
-        log.info("   👑 %d Challengers", len(r_c.json().get('entries', [])))
+        log.info("   %d Challengers", len(r_c.json().get('entries', [])))
         
     # Grandmaster
     url_gm = f"https://{REGION_PLATFORM}.api.riotgames.com/lol/league/v4/grandmasterleagues/by-queue/RANKED_SOLO_5x5"
@@ -351,9 +324,9 @@ def get_top_players_euw() -> list:
         gm_entries = r_gm.json().get('entries', [])
         top_gm = sorted(gm_entries, key=lambda x: x.get('leaguePoints', 0), reverse=True)[:100]
         players.extend(top_gm)
-        log.info("   💎 %d Grandmasters", len(top_gm))
+        log.info("   %d Grandmasters", len(top_gm))
         
-    log.info("✅ %d jugadores en lista total.", len(players))
+    log.info("%d jugadores en lista total.", len(players))
     return players
 
 
@@ -370,31 +343,24 @@ def get_puuid_from_summoner_id(summoner_id: str) -> str:
     r = _riot_api_call(f"{base}/lol/summoner/v4/summoners/{summoner_id}")
     if r and r.status_code == 200:
         return r.json().get("puuid", "")
-    log.warning("⚠️ Fallo al resolver PUUID de %s: %s", summoner_id, r.status_code if r else "Timeout")
+    log.warning("Fallo al resolver PUUID de %s: %s", summoner_id, r.status_code if r else "Timeout")
     return ""
 
 
 def get_recent_match_ids_riot(puuid: str, count: int = MAX_MATCHES_PER_PLAYER,
                                queue: int = 420) -> list:
-    """
-    Obtiene los últimos match_ids de un jugador via Match v5 API.
-    Por defecto solo Ranked Solo (queue=420).
-    Devuelve lista de strings como ["EUW1_7799124028", ...].
-    """
+
     url = (f"https://{REGION_ROUTING}.api.riotgames.com/lol/match/v5/matches"
            f"/by-puuid/{puuid}/ids?queue={queue}&start=0&count={count}")
     r = _riot_api_call(url)
     if r and r.status_code == 200:
-        return r.json()  # lista de match_ids
+        return r.json()  
     return []
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # 7. Modo automático — descarga partidas top EUW
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _load_auto_state() -> set:
-    """Carga los match_ids ya descargados/intentados."""
     if os.path.exists(AUTO_STATE_FILE):
         try:
             with open(AUTO_STATE_FILE, 'r') as f:
@@ -405,18 +371,13 @@ def _load_auto_state() -> set:
 
 
 def _save_auto_state(downloaded: set):
-    """Persiste los match_ids ya procesados."""
     with open(AUTO_STATE_FILE, 'w') as f:
         json.dump({"downloaded": list(downloaded)}, f)
 
 
 def auto_download_mode():
-    """
-    Modo monitor: busca partidas recientes de Challenger/GM en EUW
-    y las descarga automáticamente via LCU.
-    """
     print("\n" + "═" * 65)
-    print("   🤖 MODO AUTO-DESCARGA — Top EUW")
+    print(" MODO AUTO-DESCARGA — Top EUW")
     print("   ─────────────────────────────────────────────")
     print(f"   Región:       {REGION_PREFIX}")
     print(f"   Replays dir:  {REPLAYS_DIR}")
@@ -425,14 +386,13 @@ def auto_download_mode():
     print("═" * 65 + "\n")
 
     downloaded = _load_auto_state()
-    log.info("📁 %d partidas ya procesadas en estado previo.", len(downloaded))
+    log.info("%d partidas ya procesadas en estado previo.", len(downloaded))
 
     players = get_top_players_euw()
     if not players:
-        log.error("❌ No se pudieron obtener jugadores. Comprueba la API key.")
+        log.error("No se pudieron obtener jugadores. Comprueba la API key.")
         return
 
-    # Cargar caché de PUUIDs
     puuid_cache_file = "puuid_cache_euw.json"
     puuid_cache = {}
     if os.path.exists(puuid_cache_file):
@@ -441,7 +401,7 @@ def auto_download_mode():
                 puuid_cache = json.load(f)
         except Exception: pass
 
-    log.info("🔑 Resolviendo PUUIDs (%d en caché)...", len(puuid_cache))
+    log.info("Resolviendo PUUIDs (%d en caché)...", len(puuid_cache))
     
     player_puuids = []
     new_resolutions = 0
@@ -452,12 +412,10 @@ def auto_download_mode():
         puuid = p.get("puuid", "")  
 
         if not puuid:
-            # Fall back to cache keyed by summonerId
             puuid = puuid_cache.get(sid, "")
 
         if not puuid and sid:
-            # Last resort: call summoner v4
-            log.info("   🔍 Resolviendo via summoner API: %s", sid)
+            log.info("Resolviendo via summoner API: %s", sid)
             puuid = get_puuid_from_summoner_id(sid)
             if puuid:
                 puuid_cache[sid] = puuid
@@ -466,10 +424,9 @@ def auto_download_mode():
                     with open(puuid_cache_file, 'w') as f:
                         json.dump(puuid_cache, f)
             else:
-                log.warning("   ⚠️ No se pudo resolver PUUID para summonerId=%s", sid)
-            time.sleep(1.2)  # Rate limit
+                log.warning("No se pudo resolver PUUID para summonerId=%s", sid)
+            time.sleep(1.2)  
         elif puuid and sid and sid not in puuid_cache:
-            # Cache the puuid we got directly from the entry
             puuid_cache[sid] = puuid
             new_resolutions += 1
 
@@ -480,20 +437,19 @@ def auto_download_mode():
                 "name": p.get("summonerName", p.get("riotIdGameName", "Unknown"))
             })
 
-    # Guardar caché final
     if new_resolutions > 0:
         with open(puuid_cache_file, 'w') as f:
             json.dump(puuid_cache, f)
             
-    log.info("👥 %d jugadores listos para monitoreo.", len(player_puuids))
+    log.info("%d jugadores listos para monitoreo.", len(player_puuids))
 
-    log.info("👥 %d jugadores con PUUID listo.", len(player_puuids))
+    log.info("%d jugadores con PUUID listo.", len(player_puuids))
 
     # ── Bucle principal ──
     cycle = 0
     while True:
         cycle += 1
-        log.info("\n🔄 Ciclo #%d — Buscando partidas nuevas...", cycle)
+        log.info("\nCiclo #%d — Buscando partidas nuevas...", cycle)
 
         new_matches = []
         checked = 0
@@ -505,63 +461,57 @@ def auto_download_mode():
                     new_matches.append(mid)
                     downloaded.add(mid)  
             checked += 1
-            time.sleep(0.8)  # rate-limit
+            time.sleep(0.8) 
 
-            # Log progreso cada 10 jugadores
             if checked % 10 == 0:
-                log.info("   🔍 %d/%d jugadores revisados, %d nuevas encontradas...",
+                log.info("%d/%d jugadores revisados, %d nuevas encontradas...",
                          checked, len(player_puuids), len(new_matches))
 
-        # Eliminar duplicados manteniendo orden
         unique_matches = list(dict.fromkeys(new_matches))
-        log.info("📋 %d partidas nuevas encontradas en ciclo #%d", len(unique_matches), cycle)
+        log.info("%d partidas nuevas encontradas en ciclo #%d", len(unique_matches), cycle)
 
         # Descargar cada partida nueva
         success = 0
         errors  = 0
         for i, match_id in enumerate(unique_matches, 1):
-            log.info("\n⬇️  [%d/%d] Descargando %s...", i, len(unique_matches), match_id)
+            log.info("[%d/%d] Descargando %s...", i, len(unique_matches), match_id)
             try:
                 request_download(match_id)
-                # Esperar a que el .rofl aparezca
                 rofl = wait_for_rofl(match_id, timeout=DOWNLOAD_TIMEOUT)
-                log.info("✅ Descargado: %s", rofl.name)
+                log.info("Descargado: %s", rofl.name)
                 success += 1
             except FileNotFoundError as e:
-                log.warning("⚠️ LCU no disponible: %s", e)
-                log.info("💤 Esperando 30s antes de reintentar...")
+                log.warning("LCU no disponible: %s", e)
+                log.info("Esperando 30s antes de reintentar...")
                 time.sleep(30)
                 errors += 1
             except RuntimeError as e:
-                log.warning("⚠️ No se pudo descargar %s: %s", match_id, e)
+                log.warning("No se pudo descargar %s: %s", match_id, e)
                 errors += 1
             except TimeoutError as e:
-                log.warning("⏰ Timeout %s: %s", match_id, e)
+                log.warning("Timeout %s: %s", match_id, e)
                 errors += 1
             except Exception as e:
-                log.error("❌ Error inesperado %s: %s", match_id, e)
+                log.error("Error inesperado %s: %s", match_id, e)
                 errors += 1
 
-            # Guardar estado tras cada descarga
             _save_auto_state(downloaded)
-            time.sleep(2)  # pausa entre descargas
+            time.sleep(2)  
 
-        log.info("\n📊 Ciclo #%d completado: %d descargadas, %d errores",
+        log.info("Ciclo #%d completado: %d descargadas, %d errores",
                  cycle, success, errors)
-        log.info("📁 Total procesadas: %d", len(downloaded))
+        log.info("Total procesadas: %d", len(downloaded))
         _save_auto_state(downloaded)
 
         if not unique_matches:
-            log.info("😴 Sin partidas nuevas. Esperando %ds...", AUTO_CHECK_INTERVAL)
+            log.info("Sin partidas nuevas. Esperando %ds...", AUTO_CHECK_INTERVAL)
         else:
-            log.info("⏳ Siguiente chequeo en %ds...", AUTO_CHECK_INTERVAL)
+            log.info("Siguiente chequeo en %ds...", AUTO_CHECK_INTERVAL)
 
         time.sleep(AUTO_CHECK_INTERVAL)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # 8. CLI interactivo (historial propio)
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _fmt_duration(s: int) -> str:
     m, sec = divmod(s, 60)
@@ -576,11 +526,11 @@ def _fmt_date(ts_ms: int) -> str:
 
 
 def cli_interactive():
-    print("\n📋 Obteniendo historial de partidas via LCU...\n")
+    print("\n Obteniendo historial de partidas via LCU...\n")
     try:
         games = get_match_history(20)
     except Exception as e:
-        print(f"❌ {e}")
+        print(f"{e}")
         sys.exit(1)
 
     print(f"{'#':<4} {'Match ID':<22} {'Resultado':<12} {'Cola':<16} {'Dur.':<8} {'Fecha'}")
@@ -597,44 +547,42 @@ def cli_interactive():
 
     elif choice == "all":
         for g in games:
-            print(f"\n⬇️  {g['match_id']}...")
+            print(f"\n{g['match_id']}...")
             try:
                 rofl = download_and_wait(g["match_id"])
-                print(f"   ✅ {rofl}")
+                print(f"   {rofl}")
             except Exception as e:
-                print(f"   ⚠️  {e}")
+                print(f"   {e}")
 
     elif choice.isdigit() and 1 <= int(choice) <= len(games):
         g = games[int(choice) - 1]
-        print(f"\n⬇️  Descargando {g['match_id']}...")
+        print(f"\n Descargando {g['match_id']}...")
         try:
             rofl = download_and_wait(g["match_id"])
-            print(f"\n✅ Rofl listo en: {rofl}")
+            print(f"\nRofl listo en: {rofl}")
         except Exception as e:
-            print(f"\n❌ {e}")
+            print(f"\n{e}")
             sys.exit(1)
 
     else:
         # Asumir match_id directo
-        print(f"\n⬇️  Descargando {choice}...")
+        print(f"\nDescargando {choice}...")
         try:
             rofl = download_and_wait(choice)
-            print(f"\n✅ Rofl listo en: {rofl}")
+            print(f"\nRofl listo en: {rofl}")
         except Exception as e:
-            print(f"\n❌ {e}")
+            print(f"\n{e}")
             sys.exit(1)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # 9. Entry point
-# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     if "--auto" in sys.argv:
         try:
             auto_download_mode()
         except KeyboardInterrupt:
-            log.info("👋 Auto-descarga detenida.")
+            log.info("Auto-descarga detenida.")
             sys.exit(0)
 
     elif len(sys.argv) < 2:
@@ -643,7 +591,7 @@ if __name__ == "__main__":
     else:
         try:
             rofl = download_and_wait(sys.argv[1])
-            print(f"\n✅ Rofl listo en: {rofl}")
+            print(f"\n Rofl listo en: {rofl}")
         except FileNotFoundError as e:
             log.error("%s", e); sys.exit(2)
         except RuntimeError as e:
