@@ -2,11 +2,11 @@ import time, os, json, sys
 import cv2, keyboard, requests, urllib3
 urllib3.disable_warnings()
 
-sys.path.insert(0, r"C:\Users\Adrian\Downloads")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from minimap_tracker import capture_minimap, MINIMAP_W, MINIMAP_H
 import detector_v2
 
-DATASET = r"C:\Users\Adrian\Downloads\dataset"
+DATASET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset")
 LABELED = os.path.join(DATASET, "labeled")
 INTERVALO = 1.0   
 CROP_R, SAVE = 14, 32

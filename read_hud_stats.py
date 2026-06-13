@@ -135,7 +135,7 @@ def get_routing_value(region: str) -> str:
 
 
 class ReplayExtractor:
-    def __init__(self, league_path: str = r"I:\Riot Games\League of Legends"):
+    def __init__(self, league_path: str = os.getenv("LOL_PATH", r"I:\Riot Games\League of Legends")):
         self.league_path = Path(league_path)
         self.lockfile_path = self.league_path / "lockfile"
         self.replay_api_url = "https://127.0.0.1:2999"
@@ -143,7 +143,7 @@ class ReplayExtractor:
         self.lcu_port = None
         self.lcu_token = None
         self.lcu_headers = None
-        self.riot_api_key = os.getenv('RIOT_API_KEY', 'RGAPI-02d50cba-5f08-44a6-9233-a119face5ced')
+        self.riot_api_key = os.getenv('RIOT_API_KEY', 'TU_API_KEY_AQUI')  # https://developer.riotgames.com
         self._load_lcu_credentials()
         
         # Carga del catálogo de items de OP.GG / DDragon para extraer nombres de las botas
@@ -614,7 +614,7 @@ def process_batch(replays_dir: str, output_dir: str):
                 print("")
 
 if __name__ == "__main__":
-    REPLAYS_DIR = r"I:\Riot Games\lol Replays"
+    REPLAYS_DIR = os.getenv("LOL_REPLAYS_DIR", r"I:\Riot Games\lol Replays")
     OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "replays_data_extracted")
     
     print("Iniciando Herramienta de Extracción Robusta...")

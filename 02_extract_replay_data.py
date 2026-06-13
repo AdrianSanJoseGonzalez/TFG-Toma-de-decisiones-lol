@@ -10,7 +10,7 @@ from pathlib import Path
 from base64 import b64encode
 import sys
 
-sys.path.insert(0, r"c:\Users\Adrian\Downloads")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from read_hud_stats import HUDReader
 except ImportError:
@@ -169,7 +169,7 @@ def _null_stats(res_key, max_res_key):
 
 
 class ReplayExtractor:
-    def __init__(self, league_path: str = r"I:\Riot Games\League of Legends"):
+    def __init__(self, league_path: str = os.getenv("LOL_PATH", r"I:\Riot Games\League of Legends")):
         self.league_path = Path(league_path)
         self.lockfile_path = self.league_path / "lockfile"
         self.replay_api_url = "https://127.0.0.1:2999"
@@ -177,7 +177,7 @@ class ReplayExtractor:
         self.lcu_port = None
         self.lcu_token = None
         self.lcu_headers = None
-        self.riot_api_key = os.getenv('RIOT_API_KEY', 'RGAPI-250005da-97b6-4586-b554-72dc659c5119')
+        self.riot_api_key = os.getenv('RIOT_API_KEY', 'TU_API_KEY_AQUI')  # https://developer.riotgames.com
         self._load_lcu_credentials()
         self.hud_reader = HUDReader() if HUDReader else None
         
@@ -769,8 +769,11 @@ def process_batch(replays_dir: str, output_dir: str):
                 print("")
 
 if __name__ == "__main__":
-    REPLAYS_DIR = r"I:\Riot Games\lol Replays"
-    OUTPUT_DIR = r"F:\replays_data_extracted"
+    # AJUSTA estas rutas a tu instalación:
+    #  - REPLAYS_DIR: carpeta de repeticiones del cliente de League of Legends
+    #  - OUTPUT_DIR:  carpeta donde se guardan los JSON extraídos
+    REPLAYS_DIR = os.getenv("LOL_REPLAYS_DIR", r"I:\Riot Games\lol Replays")
+    OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "replays_data_extracted")
     
     print("Iniciando Herramienta de Extracción Robusta...")
     try:
