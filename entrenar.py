@@ -4,9 +4,10 @@ urllib3.disable_warnings()
 import torch, torch.nn as nn
 torch.manual_seed(0); np.random.seed(0); random.seed(0)
 
-DATASET = r"C:\Users\Adrian\Downloads\dataset"
+_BASE   = os.path.dirname(os.path.abspath(__file__))
+DATASET = os.path.join(_BASE, "dataset")
 LABELED = os.path.join(DATASET, "labeled")
-CACHE   = r"C:\Users\Adrian\Downloads\champ_circle"
+CACHE   = os.path.join(_BASE, "champ_circle")
 SIZE    = 24
 MIN_REAL_PER_CLASS = 5   
 
@@ -25,7 +26,7 @@ cidx = {c:i for i,c in enumerate(classes)}
 print(f"Clases ({len(classes)}): " + ", ".join(f"{c}({len(real[c])})" for c in classes))
 
 # ── iconos reales para sintético ────────────────────────────────────
-bgs = [cv2.imread(p) for p in glob.glob(r"C:\Users\Adrian\Downloads\capturas_limpias\limpia_*.png")]
+bgs = [cv2.imread(p) for p in glob.glob(os.path.join(_BASE, "capturas_limpias", "limpia_*.png"))]
 bgs = [b for b in bgs if b is not None]
 def rand_bg(dd):
     if bgs and random.random()<0.8:

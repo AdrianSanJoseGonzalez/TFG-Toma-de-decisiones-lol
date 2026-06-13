@@ -63,7 +63,9 @@ def _candidates_from_mask(mask, gray, color_mask, team, top_crop):
 
 # ── Quita-estructuras: las torres/wards son sprites FIJOS (escudo con nº) ──
 import os as _os, json
-_SHIELD_PATH = r"C:\Users\Adrian\Downloads\_assets\shield_tmpl.png"
+_BASE   = _os.path.dirname(_os.path.abspath(__file__))
+_ASSETS = _os.path.join(_BASE, "_assets")
+_SHIELD_PATH = _os.path.join(_ASSETS, "shield_tmpl.png")
 _SHIELD = cv2.imread(_SHIELD_PATH, cv2.IMREAD_GRAYSCALE) if _os.path.exists(_SHIELD_PATH) else None
 SHIELD_THRESH = 0.28   
 
@@ -79,7 +81,7 @@ def _shield_score(gray, cx, cy):
 
 
 # ── Mapa de POSICIONES de estructuras (torres/base) — robusto entre partidas ──
-_ESTRUCT_PATH = r"C:\Users\Adrian\Downloads\_assets\estructuras.json"
+_ESTRUCT_PATH = _os.path.join(_ASSETS, "estructuras.json")
 _ESTRUCTURAS = json.load(open(_ESTRUCT_PATH)) if _os.path.exists(_ESTRUCT_PATH) else []
 ESTRUCT_DIST = 9   
 def _es_estructura(cx, cy):
@@ -123,16 +125,16 @@ def detectar_campeones(img, top_crop=0, debug=False, quitar_estructuras=False):
 
 # ════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    clean = sorted(glob.glob(r"C:\Users\Adrian\Downloads\capturas_limpias\limpia_*.png"))
+    clean = sorted(glob.glob(_os.path.join(_BASE, "capturas_limpias", "limpia_*.png")))
     if clean:
         imgs, top = clean, 0
         print(f"Usando {len(clean)} capturas LIMPIAS\n")
     else:
-        imgs = sorted(glob.glob(r"C:\Users\Adrian\Downloads\debug_minimap_rafaga_*.png"))
+        imgs = sorted(glob.glob(_os.path.join(_BASE, "debug_minimap_rafaga_*.png")))
         top = 16
         print(f"Sin capturas limpias. Usando {len(imgs)} de debug (top_crop=16)\n")
 
-    OUT = r"C:\Users\Adrian\Downloads\_diag_out"
+    OUT = _os.path.join(_BASE, "_diag_out")
     os.makedirs(OUT, exist_ok=True)
 
     for path in imgs:

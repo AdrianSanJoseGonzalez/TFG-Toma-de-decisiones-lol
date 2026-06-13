@@ -47,7 +47,7 @@ except ImportError as e:
     print("    Las coordenadas seran null. Pon minimap_tracker.py en la misma carpeta.")
 
 # ── Configuración ─────────────────────────────────────────────────
-OUTPUT_DIR      = r"F:\replays_data_extracted_live"   # Mismo dir que los replays
+OUTPUT_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "replays_data_extracted_live")
 POLL_INTERVAL   = 10.0   # Segundos entre snapshots (igual que replays)
 RETRY_INTERVAL  = 3.0    # Segundos entre reintentos cuando no hay partida
 MAX_RETRIES     = 5      # Reintentos antes de considerar que la partida acabó

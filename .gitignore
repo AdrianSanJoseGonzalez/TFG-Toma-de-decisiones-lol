@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+
+# Modelos y resultados regenerables (se crean al entrenar)
+ml_models/
+
+# Datos intermedios pesados (no se entregan; se regeneran)
+replays_data_extracted/
+Replays_Recorded_KR/
+*.rofl
+dataset/game_*/
+
+# Salidas de diagnóstico / depuración
+_diag_out/
+debug_*.png
+capturas_limpias/
+champ_circle/
+champion_icons/
+
+# IDE / Sistema operativo
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

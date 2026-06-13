@@ -11,7 +11,7 @@ from zonas_mapa import (
 )
 
 BASE_DIR    = Path(__file__).resolve().parent
-INPUT_DIR   = r"F:\replays_data_extracted"
+INPUT_DIR   = str(BASE_DIR / "replays_data_extracted")
 OUTPUT_FILE = str(BASE_DIR / "ml_dataset" / "dataset_completo.csv")
 
 GRUBS_SPAWN     = 300    

@@ -1,0 +1,36 @@
+# Dependencias del proyecto.
+# Instalación:  pip install -r requirements.txt
+#
+# Requiere además dos componentes externos que NO se instalan con pip:
+#   - Tesseract OCR  (motor de OCR para read_hud_stats.py)  ->  https://github.com/UB-Mannheim/tesseract
+#   - Cliente de League of Legends  (necesario para 02 y para la detección en vivo)
+
+# --- Datos y cálculo numérico ---
+numpy
+pandas
+scikit-learn
+
+# --- Modelos ---
+xgboost
+torch
+optuna
+
+# --- Visión por computador / OCR ---
+opencv-python
+mss
+pytesseract
+Pillow
+dxcam
+
+# --- Acceso a las API (web y cliente local) ---
+requests
+urllib3
+
+# --- Adquisición / utilidades ---
+watchdog
+keyboard
+joblib
+
+# --- Gráficos ---
+matplotlib
+seaborn

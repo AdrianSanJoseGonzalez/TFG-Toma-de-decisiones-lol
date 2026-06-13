@@ -3,11 +3,11 @@ import cv2, numpy as np, os, sys, json, time, glob
 import requests, urllib3
 urllib3.disable_warnings()
 import torch, torch.nn as nn
-sys.path.insert(0, r"C:\Users\Adrian\Downloads")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import detector_v2
 from minimap_tracker import capture_minimap
 
-DATASET = r"C:\Users\Adrian\Downloads\dataset"
+DATASET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset")
 OUT = os.path.join(DATASET, "vistas"); os.makedirs(OUT, exist_ok=True)
 API = "https://127.0.0.1:2999/liveclientdata"
 SIZE, R, SCALE, CONF_MIN = 24, 16, 2, 0.45   

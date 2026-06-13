@@ -30,7 +30,7 @@ POLL_INTERVAL    = 2
 REGION_PREFIX    = "EUW1"
 
 # ── Riot API (Modo Monitor EUW) ───────────────────────────────────────────────
-API_KEY          = os.getenv('RIOT_API_KEY', 'RGAPI-950d1cfb-cf16-4985-8bb8-802f3965100e')
+API_KEY          = os.getenv('RIOT_API_KEY', 'TU_API_KEY_AQUI')  # https://developer.riotgames.com
 REGION_PLATFORM  = "euw1"
 REGION_ROUTING   = "europe"
 PLATFORM_ID      = "EUW1"

@@ -32,7 +32,7 @@ MINIMAP_H = 360
 GAME_X_MIN, GAME_X_MAX = 0,    15120
 GAME_Z_MIN, GAME_Z_MAX = -400, 15220
 
-ICONS_DIR = r"C:\Users\Adrian\Downloads\champion_icons"
+ICONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "champion_icons")
 
 _ICON_BBOX = (774, 353, 1145, 726)
 
@@ -858,7 +858,7 @@ def get_live_champions():
 if __name__ == "__main__":
     import keyboard
 
-    DOWNLOADS_DIR = r"C:\Users\Adrian\Downloads"
+    DOWNLOADS_DIR = os.path.dirname(os.path.abspath(__file__))
     LOG_FILE      = os.path.join(DOWNLOADS_DIR, "debug_log_rafaga.txt")
 
     print("\n[Minimap] Intentando detectar campeones automáticamente...")
