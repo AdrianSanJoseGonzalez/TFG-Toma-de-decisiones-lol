@@ -1,0 +1,13 @@
+{
+  "roster": {
+    "ORDER": [
+      "Azir",
+      "Malphite",
+      "Yorick",
+      "Maokai",
+      "Varus"
+    ],
+    "CHAOS": []
+  },
+  "my_team": "ORDER"
+}
