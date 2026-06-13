@@ -62,7 +62,6 @@ INDEX_TO_KEY = ['1', '2', '3', '4', '5', 'q', 'w', 'e', 'r', 't']
 def press_key(vk_code, scan_code=0):
     extra = ctypes.c_ulong(0)
     ii_ = Input_I()
-    # 0x0008 = KEYEVENTF_SCANCODE
     flags = 0x0008 if scan_code else 0
     ii_.ki = KeyBdInput(vk_code, scan_code, flags, 0, ctypes.pointer(extra))
     x = Input(ctypes.c_ulong(1), ii_)
@@ -178,7 +177,7 @@ class ReplayExtractor:
         self.lcu_port = None
         self.lcu_token = None
         self.lcu_headers = None
-        self.riot_api_key = os.getenv('RIOT_API_KEY', 'RGAPI-af4c2d3e-90e7-42a9-9263-e94b43497674')
+        self.riot_api_key = os.getenv('RIOT_API_KEY', 'RGAPI-250005da-97b6-4586-b554-72dc659c5119')
         self._load_lcu_credentials()
         self.hud_reader = HUDReader() if HUDReader else None
         
@@ -410,7 +409,6 @@ class ReplayExtractor:
                 
                 # APLICAR OFFSET DE CORRECCIÓN (+1240 en Z)
                 # Este valor corrige el desfase de perspectiva del motor de Riot
-                # para que el punto coincida exactamente con la vertical del campeón.
                 return {
                     "x": x_final,
                     "z": z_final + 1240.0
@@ -485,12 +483,10 @@ class ReplayExtractor:
     def _save_json(self, output_file: str, data: list):
         if not data: return
         try:
-            # Aplicamos heuristicas post-extracción antes de volcar al disco
             data = self.apply_boots_fix(data)
             
             with open(output_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            # print(f"    [Guardado] {len(data)} snapshots en disco.")
         except Exception as e:
             print(f"[ERROR] No se pudo guardar JSON: {e}")
 
@@ -517,7 +513,7 @@ class ReplayExtractor:
                     
                     # Bucle de sincronización: Esperamos a que el motor del juego llegue al tiempo (o cerca)
                     synced = False
-                    for _ in range(10): # Max 5 segundos de espera
+                    for _ in range(10): 
                         time.sleep(0.5)
                         try:
                             res_sync = requests.get(f"{self.replay_api_url}/liveclientdata/allgamedata", verify=False, timeout=2)
@@ -575,7 +571,6 @@ class ReplayExtractor:
                         # Capturar Estadísticas Vitales con OCR del HUD
                         try:
                             if self.hud_reader:
-                                # Determinar tipo de recurso para el JSON
                                 champ_norm = champ.lower().replace(" ", "").replace(".", "").replace("'", "")
                                 energy_champs = {"akali", "kennen", "leesin", "shen", "zed"}
                                 fury_champs = {"renekton", "tryndamere", "shyvana", "gnar", "reksai", "kled"}
@@ -639,7 +634,6 @@ class ReplayExtractor:
                         # ===== PARTE A: INYECTAR BOTAS =====
                         items = p.get("items", [])
                         current_item_ids = [item.get("itemID") for item in items]
-                        # Comprobar si tiene alguna bota de la lista tradicional
                         tiene_botas = any(b_id in current_item_ids for b_id in botas_ids)
                         
                         # Solo inyectamos para los ADC (BOTTOM) si han completado la misión

@@ -6,21 +6,21 @@ import numpy as np
 from pathlib import Path
 from zonas_mapa import (
     MAP_X_MIN, MAP_X_MAX, MAP_Z_MIN, MAP_Z_MAX,
-    DRAGON_PIT, BARON_PIT, ZONAS_MAPA, ZONA_CATEGORIA,
+    DRAGON_PIT, BARON_PIT, TOWER_POSITIONS, ZONAS_MAPA, ZONA_CATEGORIA,
     dist_2d, norm, obtener_zona,
 )
 
+BASE_DIR    = Path(__file__).resolve().parent
 INPUT_DIR   = r"F:\replays_data_extracted"
-OUTPUT_FILE = r"C:\Users\Adrian\.gemini\antigravity\scratch\lol_replay_downloader\ml_dataset\dataset_completo.csv"
+OUTPUT_FILE = str(BASE_DIR / "ml_dataset" / "dataset_completo.csv")
 
-# ── Constantes de timing de objetivos (segundos) ─────────────────
-GRUBS_SPAWN     = 300    # min 5
-GRUBS_DESPAWN   = 840    # min 14
-HERALD_SPAWN    = 840    # min 14
-HERALD_DESPAWN  = 1185   # min 19:45
-BARON_SPAWN     = 1200   # min 20
-DRAGON_RESPAWN  = 300    # 5 min después de morir
-BARON_RESPAWN   = 360    # 6 min después de morir
+GRUBS_SPAWN     = 300    
+GRUBS_DESPAWN   = 840    
+HERALD_SPAWN    = 840    
+HERALD_DESPAWN  = 1185   
+BARON_SPAWN     = 1200   
+DRAGON_RESPAWN  = 300    
+BARON_RESPAWN   = 360   
 
 # ── IDs de items clave ────────────────────────────────────────────
 BOOTS_IDS  = {1001, 3006, 3047, 3111, 3158, 3020, 3009, 3117, 3115, 3008}
@@ -53,6 +53,7 @@ def nearest_dist(player, all_players, same_team):
     best = 99999
     for p in all_players:
         if p.get("riotId") == player.get("riotId"): continue
+        if p.get("isDead", False): continue # Mismo criterio que count_nearby
         if (p["team"] == player["team"]) != same_team: continue
         ep = get_pos(p)
         if ep:
@@ -66,9 +67,21 @@ def items_gold(player):
 def has_item_type(player, item_ids):
     return int(any(i.get("itemID") in item_ids for i in player.get("items", [])))
 
+def nearest_tower_dist(px, pz, towers_team):
+    """Distancia a la torre VIVA más cercana de un equipo (dict lane->posiciones)."""
+    best = 99999
+    for tower_list in towers_team.values():
+        for (tx, tz) in tower_list:
+            d = dist_2d(px, pz, tx, tz)
+            if d < best: best = d
+    return best
+
 # ── Etiquetado de acciones ────────────────────────────────────────
-OBJECTIVE_RADIUS  = 800   # Radio más preciso (era 1200, demasiado grande)
+OBJECTIVE_RADIUS  = 800   
 TEAMFIGHT_RADIUS  = 2500
+
+PUSH_BACKFILL_WINDOW = 45.0          
+PUSH_RELABEL_SAFE    = {"FARM", "MOVE"}  
 
 def get_action_label(player, all_players, all_events, t_now, t_next,
                      kda_deltas, hp_deltas):
@@ -79,7 +92,6 @@ def get_action_label(player, all_players, all_events, t_now, t_next,
         return "DEAD"
 
     px, pz   = pos
-    # IMPORTANTE: Los eventos del JSON usan el nombre del CAMPEÓN (ej: "Gnar"), no el de invocador.
     champ_name = player.get("championName", "")
     role     = player.get("position", "").upper()
     team     = player.get("team", "")
@@ -106,13 +118,11 @@ def get_action_label(player, all_players, all_events, t_now, t_next,
                   and e.get("EventTime", 0) < GRUBS_DESPAWN]
 
     # ── Involucración del jugador ───────────────────────────────
-    # Nota: KDA deltas usa p_name porque lo calculamos nosotros por invocador
     p_name           = player.get("riotIdGameName") or player.get("summonerName", "")
     my_delta         = kda_deltas.get(p_name, (0, 0, 0))
     my_involved_kda  = any(d > 0 for d in my_delta)
     my_took_damage   = hp_deltas.get(p_name, 0) < -0.10
     
-    # Comparamos con champ_name en los eventos del JSON
     my_in_kill       = any(
         e.get("KillerName") == champ_name or
         champ_name in e.get("Assisters", []) or
@@ -133,7 +143,6 @@ def get_action_label(player, all_players, all_events, t_now, t_next,
             pn = p.get("riotIdGameName") or p.get("summonerName", "")
             d  = kda_deltas.get(pn, (0, 0, 0))
             h  = hp_deltas.get(pn, 0)
-            # Se considera peleando si sube KDA o si pierde >10% de HP
             if any(x > 0 for x in d) or h < -0.10:
                 fighters_nearby += 1
 
@@ -143,9 +152,7 @@ def get_action_label(player, all_players, all_events, t_now, t_next,
     dist_drake = dist_2d(px, pz, *DRAGON_PIT)
     dist_baron = dist_2d(px, pz, *BARON_PIT)
 
-    # ═══════════════════════════════════════════════════════════
     # ÁRBOL DE DECISIÓN DE LABELS
-    # ═══════════════════════════════════════════════════════════
 
     # 1. PUSH_INHIB — jugador involucrado en destruir inhibidor
     my_in_inhib = any(
@@ -257,10 +264,15 @@ def process_game(json_path):
     # Torres por lane: cuántas torres ha destruido cada equipo en cada carril
     towers_order_lane = {"TOP_LANE": 0, "MID_LANE": 0, "BOT_LANE": 0}
     towers_chaos_lane = {"TOP_LANE": 0, "MID_LANE": 0, "BOT_LANE": 0}
+    # Torres vivas por equipo (copia mutable de las posiciones fijas)
+    towers_alive = {
+        team_id: {lane: list(positions) for lane, positions in lanes.items()}
+        for team_id, lanes in TOWER_POSITIONS.items()
+    }
     seen_events = set()
 
-    prev_players = {}  # Para KDA deltas
-    prev_hp      = {}  # Para HP deltas
+    prev_players = {}  
+    prev_hp      = {} 
 
     # ── 1. Determinar el final de la partida para limpiar ruido ──
     max_time = 0
@@ -269,13 +281,13 @@ def process_game(json_path):
         if isinstance(t, (int, float)) and t > max_time:
             max_time = t
     
-    end_threshold = max_time - 10.0 # Omitimos los últimos 10 segundos
+    end_threshold = max_time - 10.0 
 
     rows = []
 
     for i, snap in enumerate(data):
         t_now      = snap["game_time"]
-        if t_now == 0 or t_now > end_threshold: continue # Omitir segundo 0 por ruido y datos incompletos
+        if t_now == 0 or t_now > end_threshold: continue 
         
         t_next     = data[i+1]["game_time"] if i+1 < len(data) else t_now + 10
         all_players = snap.get("all_players", [])
@@ -331,6 +343,13 @@ def process_game(json_path):
                 elif tower_team == 200: # ORDER destruyó torre de CHAOS
                     towers_order += 1
                     if lane in towers_order_lane: towers_order_lane[lane] += 1
+
+                if tower_team in towers_alive:
+                    lane_towers = towers_alive[tower_team].get(lane)
+                    if lane_towers:
+                        lane_towers.pop(0)
+                    elif towers_alive[tower_team]["NEXUS"]:
+                        towers_alive[tower_team]["NEXUS"].pop(0)
 
             elif ename == "InhibitorKill":
                 inhib_team = ev.get("TeamId", 0)
@@ -438,6 +457,11 @@ def process_game(json_path):
             dist_drake = dist_2d(px, pz, *DRAGON_PIT) if pos else 99999
             dist_baron = dist_2d(px, pz, *BARON_PIT)  if pos else 99999
 
+            ally_team_id  = 100 if team == "ORDER" else 200
+            enemy_team_id = 200 if team == "ORDER" else 100
+            dist_torre_enemiga = nearest_tower_dist(px, pz, towers_alive[enemy_team_id]) if pos else 99999
+            dist_torre_aliada  = nearest_tower_dist(px, pz, towers_alive[ally_team_id])  if pos else 99999
+
             # Items
             items_list  = p.get("items",[])
             item_by_slot = {it.get("slot",-1): it.get("itemID",0) for it in items_list}
@@ -511,11 +535,6 @@ def process_game(json_path):
                 "zona":           zona,
                 "zona_categoria": zona_cat,
                 "dist_al_centro": round(dist_2d(px, pz, 7500, 7500), 0),
-                "en_lado_aliado": int((team=="ORDER" and px<7500) or (team=="CHAOS" and px>7500)),
-                "dist_fuente_aliada": round(
-                    dist_2d(px, pz, 560, 560) if team=="ORDER"
-                    else dist_2d(px, pz, 14340, 14390), 0
-                ),
 
                 # Nivel
                 "level":      p.get("level",1),
@@ -566,6 +585,8 @@ def process_game(json_path):
                 # Distancias objetivos
                 "dist_drake": round(min(dist_drake, 20000), 0),
                 "dist_baron": round(min(dist_baron, 20000), 0),
+                "dist_torre_enemiga": round(min(dist_torre_enemiga, 20000), 0),
+                "dist_torre_aliada":  round(min(dist_torre_aliada, 20000), 0),
 
                 # ── OBJETIVOS ÉPICOS ────────────────────────────
                 "dragon_aliados":     dragon_order if team=="ORDER" else dragon_chaos,
@@ -630,10 +651,6 @@ def process_game(json_path):
                     dist_2d(px, pz, 560, 560) if team == "ORDER"
                     else dist_2d(px, pz, 14340, 14390), 0
                 ),
-                "allies_near": allies_near,
-                "enemies_near": enemies_near,
-                "dist_near_ally": round(dist_near_ally, 0),
-                "dist_near_enemy": round(dist_near_enemy, 0),
 
                 # Estructuras destruidas (macro)
                 "torres_destruidas_aliado":  towers_order if team == "ORDER" else towers_chaos,
@@ -669,9 +686,36 @@ def process_game(json_path):
         df_temp["z_delta"]  = grp["z"].diff().fillna(0)
         df_temp["is_moving"] = ((df_temp["x_delta"].abs() > 10) | (df_temp["z_delta"].abs() > 10)).astype(int)
 
+        # ── RE-ETIQUETADO RETROSPECTIVO: PUSH_TOWER / PUSH_INHIB ────
+        en_zona_push = (
+            (df_temp["zona_categoria"] == "LANE") |
+            ((df_temp["zona_categoria"] == "BASE") & (df_temp["en_lado_aliado"] == 0))
+        )
+
+        seen_bf = set()
+        for ev in all_events:
+            ename = ev.get("EventName")
+            if ename not in ("TowerKill", "InhibitorKill"):
+                continue
+            key = (ename, round(ev.get("EventTime", 0), 2))
+            if key in seen_bf:
+                continue
+            seen_bf.add(key)
+
+            etime = ev.get("EventTime", 0)
+            participantes = [ev.get("KillerName", "")] + list(ev.get("Assisters", []))
+            new_label = "PUSH_INHIB" if ename == "InhibitorKill" else "PUSH_TOWER"
+
+            mask_bf = (
+                df_temp["champion"].isin(participantes)
+                & (df_temp["game_time"] >= etime - PUSH_BACKFILL_WINDOW)
+                & (df_temp["game_time"] < etime)
+                & df_temp["label"].isin(PUSH_RELABEL_SAFE)
+                & en_zona_push
+            )
+            df_temp.loc[mask_bf, "label"] = new_label
+
         # ── RE-ETIQUETADO INTELIGENTE: JUNGLE_FARM ──────────────────
-        # El JSON no dice si golpea un monstruo, pero el CS y la HP sí.
-        # Si es JUNGLE, está en MOVE, y su CS sube -> JUNGLE_FARM
         mask_jungle_move = (df_temp["role"] == "JUNGLE") & (df_temp["label"] == "MOVE")
         
         # Caso A: Sube el CS en la jungla
@@ -679,7 +723,7 @@ def process_game(json_path):
         
         # Caso B: Pierde vida notablemente (>2%) sin enemigos cerca -> Tankeando campamento
         # (Usamos 0 enemigos cerca para no confundir con escaramuzas)
-        mask_tanking = (df_temp["hp_delta"] < -0.02) & (df_temp["enemies_near"] == 0)
+        mask_tanking = (df_temp["hp_delta"] < -0.02) & (df_temp["enemies_nearby"] == 0)
         df_temp.loc[mask_jungle_move & mask_tanking, "label"] = "JUNGLE_FARM"
 
         rows = df_temp.to_dict("records")
