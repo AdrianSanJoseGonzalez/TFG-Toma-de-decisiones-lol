@@ -1,0 +1,13 @@
+{
+  "roster": {
+    "ORDER": [
+      "Alistar",
+      "Vi",
+      "Kennen",
+      "Caitlyn",
+      "Volibear"
+    ],
+    "CHAOS": []
+  },
+  "my_team": "ORDER"
+}
