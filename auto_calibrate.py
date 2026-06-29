@@ -1,7 +1,4 @@
-"""
-Auto-calibracion con cuenta atras.
-Ejecuta, alt-tab a LoL, espera la captura.
-"""
+
 import mss
 import numpy as np
 from PIL import Image
@@ -181,7 +178,7 @@ def main():
     if missing:
         print(f"  Faltan: {missing}")
     else:
-        print(f"  COMPLETO! Ya puedes usar read_hud_stats.py")
+        print(f"read_hud_stats.py usable")
     
     print(f"\n  Imagenes debug en: {debug_dir}")
     print(f"  Templates en: {TEMPLATES_DIR}")
